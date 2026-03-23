@@ -1,7 +1,9 @@
 package com.temporallearn.spring_temporal.delegates;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.temporallearn.spring_temporal.dto.PickInstruction;
 import com.temporallearn.spring_temporal.dto.TransactionUpdate;
+import com.temporallearn.spring_temporal.dto.ae.PickListEvent;
 import com.temporallearn.spring_temporal.service.PickInstructionService;
 import lombok.extern.slf4j.Slf4j;
 import org.camunda.bpm.engine.delegate.DelegateExecution;
@@ -16,8 +18,13 @@ import java.util.Optional;
  *   1. Validate and persist — idempotency check + write to transaction_status DB.
  *      If the transaction is a duplicate, stop here (do not publish to Kafka).
  *
- *   2. Publish item picked event — only after DB commit, publish TransactionUpdate
- *      to gor.item-picked-events (consumed by Butler Core).
+ *   2. Build and publish item picked events — only after DB commit, build ItemPickedEvent
+ *      for each (serviceRequest × transaction) in the full PickListEvent, then publish
+ *      all of them to gor.item_picked.events (consumed by Butler Core).
+ *      Field sources:
+ *        - PPS fields  — instructionJson Camunda process variable (PickInstruction)
+ *        - item_uid, tpid — ae_order.payload (stored PickListRequest, fetched from DB)
+ *        - transactionId, state, picked_qty — pickListEventJson process variable (PickListEvent)
  *
  *   3. Set outcome process variables:
  *      - txComplete (Boolean)      — true if the pick is now fully complete.
@@ -40,8 +47,11 @@ public class SendItemPickedEventDelegate implements JavaDelegate {
     public void execute(DelegateExecution execution) throws Exception {
         String pickId = (String) execution.getVariable("pickId");
         String transactionUpdateJson = (String) execution.getVariable("transactionUpdateJson");
+        String instructionJson = (String) execution.getVariable("instructionJson");
+        String pickListEventJson = (String) execution.getVariable("pickListEventJson");
 
         TransactionUpdate transactionUpdate = objectMapper.readValue(transactionUpdateJson, TransactionUpdate.class);
+        PickInstruction pickInstruction = objectMapper.readValue(instructionJson, PickInstruction.class);
 
         log.info("SendItemPickedEventDelegate executing for pickId: {}, transactionId: {}",
                 pickId, transactionUpdate.getTransactionId());
@@ -56,12 +66,17 @@ public class SendItemPickedEventDelegate implements JavaDelegate {
             return;
         }
 
-        // Step 2 — DB committed, now safe to publish to Kafka
-        pickInstructionService.sendItemPickedEvent(transactionUpdate);
+        // Step 2 — DB committed; build and publish ItemPickedEvents for all serviceRequests × transactions
+        if (pickListEventJson != null && !pickListEventJson.isBlank()) {
+            PickListEvent pickListEvent = objectMapper.readValue(pickListEventJson, PickListEvent.class);
+            pickInstructionService.buildAndPublishItemPickedEvents(pickId, pickInstruction, pickListEvent);
+        } else {
+            log.warn("pickListEventJson not set for pickId: {} — skipping ItemPickedEvent publish", pickId);
+        }
 
         // Step 3 — set outcome variables
         boolean txComplete = result.get();
-        log.info("Item picked event published for pickId: {}, txComplete: {}", pickId, txComplete);
+        log.info("Item picked events published for pickId: {}, txComplete: {}", pickId, txComplete);
 
         execution.setVariable("txComplete", txComplete);
 

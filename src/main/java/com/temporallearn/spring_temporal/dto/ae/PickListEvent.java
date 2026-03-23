@@ -86,6 +86,19 @@ public class PickListEvent {
         @JsonProperty("serviceRequests")
         private List<ServiceRequest> serviceRequests;
 
+        /**
+         * Order-level actuals — populated by AE on pick-list.events updates.
+         * Stored as Object (Map/List) to avoid brittle nested DTOs.
+         */
+        @JsonProperty("actuals")
+        private Object actuals;
+
+        /**
+         * Order-level expectations — may be updated by AE on pick-list.events.
+         */
+        @JsonProperty("expectations")
+        private Object expectations;
+
         @JsonProperty("createdOn")
         private String createdOn;
 
@@ -148,6 +161,19 @@ public class PickListEvent {
          */
         @JsonProperty("transactions")
         private List<Transaction> transactions;
+
+        /**
+         * Service-request-level actuals — what AE actually processed for this PICK_LINE.
+         * Stored as Object (Map/List) to avoid brittle nested DTOs.
+         */
+        @JsonProperty("actuals")
+        private Object actuals;
+
+        /**
+         * Service-request-level expectations — may be updated by AE events.
+         */
+        @JsonProperty("expectations")
+        private Object expectations;
 
         @JsonProperty("receivedOn")
         private String receivedOn;

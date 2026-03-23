@@ -3,10 +3,10 @@ package com.temporallearn.spring_temporal.downstream.listener;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.temporallearn.spring_temporal.dto.TransactionUpdate;
 import com.temporallearn.spring_temporal.dto.ae.PickListEvent;
+import com.temporallearn.spring_temporal.service.PickInstructionService;
 import lombok.extern.slf4j.Slf4j;
 import org.camunda.bpm.engine.MismatchingMessageCorrelationException;
 import org.camunda.bpm.engine.RuntimeService;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
@@ -15,13 +15,18 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * Step 4 — Kafka listener for AE item picking event messages.
+ * Step 3 — Kafka listener for AE item picking event messages.
  *
  * Consumes messages from gor.pick-list.events published by AE as items are picked
- * throughout the pick lifecycle. Maps AE state transitions to internal commands
- * and correlates the Camunda ItemPickingEventMessage signal.
+ * throughout the pick lifecycle. On every event:
  *
- * Transaction data is sourced from serviceRequests[0].transactions[0].
+ *   1. Updates ae_order.payload selectively (state/sub_state/actuals/expectations/attributes
+ *      at both the parent Payload level and per-serviceRequest level).
+ *
+ *   2. Maps AE state transitions to internal commands and correlates the Camunda
+ *      ItemPickingEventMessage signal. For pick_transaction events, the full event JSON
+ *      is also passed as a process variable so SendItemPickedEventDelegate can iterate
+ *      all service requests.
  *
  * State mapping:
  *   event_type = "pick_transaction"              → command = UPDATE,   status = IN_PROGRESS
@@ -32,11 +37,17 @@ import java.util.List;
 @Slf4j
 public class PickListEventListener {
 
-    @Autowired
-    private RuntimeService runtimeService;
+    private final RuntimeService runtimeService;
+    private final ObjectMapper objectMapper;
+    private final PickInstructionService pickInstructionService;
 
-    @Autowired
-    private ObjectMapper objectMapper;
+    public PickListEventListener(RuntimeService runtimeService,
+                                 ObjectMapper objectMapper,
+                                 PickInstructionService pickInstructionService) {
+        this.runtimeService = runtimeService;
+        this.objectMapper = objectMapper;
+        this.pickInstructionService = pickInstructionService;
+    }
 
     @KafkaListener(
             topics = "${kafka.topic.pick-list-events}",
@@ -68,12 +79,16 @@ public class PickListEventListener {
         log.info("Received pick-list event from AE | pickId: {} | event_type: {} | state: {} | sub_state: {}",
                 pickId, eventType, orderState, subState);
 
+        // Step 1 — update ae_order selectively (DB write before Camunda correlation)
+        pickInstructionService.updateAeOrderFromEvent(event);
+
+        // Step 2 — map to internal TransactionUpdate and correlate Camunda signal
         TransactionUpdate transactionUpdate = mapToTransactionUpdate(eventType, orderState, subState, pickId, eventPayload);
 
         log.info("Mapped AE event to TransactionUpdate | pickId: {} | command: {} | status: {} | transactionId: {}",
                 pickId, transactionUpdate.getCommand(), transactionUpdate.getStatus(), transactionUpdate.getTransactionId());
 
-        correlateCamundaMessage(transactionUpdate);
+        correlateCamundaMessage(transactionUpdate, event, eventType, payload);
     }
 
     // ── State mapping ────────────────────────────────────────────────────────
@@ -116,21 +131,31 @@ public class PickListEventListener {
 
     // ── Camunda correlation ──────────────────────────────────────────────────
 
-    private void correlateCamundaMessage(TransactionUpdate transactionUpdate) {
+    private void correlateCamundaMessage(TransactionUpdate transactionUpdate,
+                                         PickListEvent event,
+                                         String eventType,
+                                         String rawEventJson) {
         try {
             String transactionUpdateJson = objectMapper.writeValueAsString(transactionUpdate);
             String command = transactionUpdate.getCommand() != null
                     ? transactionUpdate.getCommand().toUpperCase()
                     : "UPDATE";
 
-            runtimeService.createMessageCorrelation("ItemPickingEventMessage")
+            var correlation = runtimeService.createMessageCorrelation("ItemPickingEventMessage")
                     .processInstanceVariableEquals("pickId", transactionUpdate.getPickId())
                     .setVariable("command", command)
                     .setVariable("txStatus", transactionUpdate.getStatus())
                     .setVariable("transactionUpdateJson", transactionUpdateJson)
                     .setVariable("transactionId", transactionUpdate.getTransactionId())
-                    .setVariable("failureReason", transactionUpdate.getAdditionalInfo())
-                    .correlate();
+                    .setVariable("failureReason", transactionUpdate.getAdditionalInfo());
+
+            // For pick_transaction events pass the full event JSON so the delegate can
+            // iterate all serviceRequests and publish one ItemPickedEvent per transaction
+            if ("pick_transaction".equalsIgnoreCase(eventType)) {
+                correlation.setVariable("pickListEventJson", rawEventJson);
+            }
+
+            correlation.correlate();
 
             log.info("ItemPickingEventMessage correlated successfully for pickId: {} | command: {} | status: {}",
                     transactionUpdate.getPickId(), command, transactionUpdate.getStatus());
@@ -140,7 +165,7 @@ public class PickListEventListener {
                     "AE item picking event dropped. transactionId: {}",
                     transactionUpdate.getPickId(), transactionUpdate.getTransactionId());
         } catch (Exception e) {
-            log.error("Failed to correlate TransactionUpdateMessage for pickId: {} | error: {}",
+            log.error("Failed to correlate ItemPickingEventMessage for pickId: {} | error: {}",
                     transactionUpdate.getPickId(), e.getMessage(), e);
         }
     }
@@ -164,7 +189,6 @@ public class PickListEventListener {
 
     /**
      * Extracts transactionId from serviceRequests[0].transactions[0].
-     * Only supporting single transaction per update
      * Falls back to pickId if absent.
      */
     private String extractTransactionId(PickListEvent.Payload payload, String fallback) {

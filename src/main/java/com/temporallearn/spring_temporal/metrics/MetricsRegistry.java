@@ -19,7 +19,4 @@ public class MetricsRegistry {
         return counters.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().get()));
     }
 
-    public void reset() {
-        counters.clear();
-    }
 }

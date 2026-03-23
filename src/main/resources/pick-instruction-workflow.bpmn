@@ -68,7 +68,6 @@
     <!-- ─── Wait for Transaction Update (Message Catch — loops back here) ─── -->
     <intermediateCatchEvent id="waitForTransactionUpdate" name="Wait for Transaction Update">
       <incoming>flow_validationGw_to_waitTx</incoming>
-      <incoming>flow_republishRetry_to_waitTx</incoming>
       <incoming>flow_updateInProgress_to_waitTx</incoming>
       <outgoing>flow_waitTx_to_sendTxKafka</outgoing>
       <messageEventDefinition id="MsgDef_txUpdate" messageRef="Message_ItemPickingEvent"/>
@@ -87,7 +86,6 @@
       <incoming>flow_sendTxKafka_to_commandGw</incoming>
       <outgoing>flow_commandGw_cancel</outgoing>
       <outgoing>flow_commandGw_complete</outgoing>
-      <outgoing>flow_commandGw_retry</outgoing>
       <outgoing>flow_commandGw_update</outgoing>
     </exclusiveGateway>
 
@@ -128,14 +126,6 @@
     <endEvent id="endComplete" name="End (Completed via Command)">
       <incoming>flow_onCompleteComplete_to_end</incoming>
     </endEvent>
-
-    <!-- ─── [RETRY PATH] Republish to Kafka and loop back ─── -->
-    <serviceTask id="republishRetry"
-                 name="Republish Order (Retry)"
-                 camunda:delegateExpression="${sendPickListToAEDelegate}">
-      <incoming>flow_commandGw_retry</incoming>
-      <outgoing>flow_republishRetry_to_waitTx</outgoing>
-    </serviceTask>
 
     <!-- ─── [UPDATE PATH] TX Failed Gateway ─── -->
     <exclusiveGateway id="txFailedGateway" name="TX Status FAILED?" default="flow_txFailedGw_notFailed">
@@ -254,13 +244,6 @@
       <conditionExpression xsi:type="tFormalExpression">${command == 'COMPLETE'}</conditionExpression>
     </sequenceFlow>
 
-    <!-- Command Gateway → Retry path -->
-    <sequenceFlow id="flow_commandGw_retry"
-                  sourceRef="commandGateway"
-                  targetRef="republishRetry">
-      <conditionExpression xsi:type="tFormalExpression">${command == 'RETRY'}</conditionExpression>
-    </sequenceFlow>
-
     <!-- Command Gateway → Update path (default) -->
     <sequenceFlow id="flow_commandGw_update"
                   sourceRef="commandGateway"
@@ -285,11 +268,6 @@
     <sequenceFlow id="flow_onCompleteComplete_to_end"
                   sourceRef="onWorkflowCompleteComplete"
                   targetRef="endComplete"/>
-
-    <!-- Republish (Retry) → loop back to Wait for TX Update -->
-    <sequenceFlow id="flow_republishRetry_to_waitTx"
-                  sourceRef="republishRetry"
-                  targetRef="waitForTransactionUpdate"/>
 
     <!-- TX Failed Gateway → TX FAILED path (txStatus == FAILED) -->
     <sequenceFlow id="flow_txFailedGw_failed"
@@ -413,10 +391,6 @@
         <dc:Bounds x="1492" y="82" width="36" height="36"/>
       </bpmndi:BPMNShape>
 
-      <bpmndi:BPMNShape id="republishRetry_di" bpmnElement="republishRetry">
-        <dc:Bounds x="1160" y="360" width="120" height="80"/>
-      </bpmndi:BPMNShape>
-
       <bpmndi:BPMNShape id="txFailedGateway_di" bpmnElement="txFailedGateway" isMarkerVisible="true">
         <dc:Bounds x="1055" y="435" width="50" height="50"/>
       </bpmndi:BPMNShape>
@@ -448,6 +422,80 @@
       <bpmndi:BPMNShape id="endUpdateComplete_di" bpmnElement="endUpdateComplete">
         <dc:Bounds x="342" y="442" width="36" height="36"/>
       </bpmndi:BPMNShape>
+
+      <!-- Sequence Flow Edges -->
+      <bpmndi:BPMNEdge id="e_start_pub" bpmnElement="flow_start_to_publishOrder">
+        <di:waypoint x="188" y="100"/><di:waypoint x="240" y="100"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_pub_waitVal" bpmnElement="flow_publishOrder_to_waitValidation">
+        <di:waypoint x="360" y="100"/><di:waypoint x="412" y="100"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_waitVal_gw" bpmnElement="flow_waitValidation_to_validationGw">
+        <di:waypoint x="448" y="100"/><di:waypoint x="495" y="100"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_gw_failed" bpmnElement="flow_validationGw_failed">
+        <di:waypoint x="520" y="125"/><di:waypoint x="520" y="200"/><di:waypoint x="600" y="200"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_gw_waitTx" bpmnElement="flow_validationGw_to_waitTx">
+        <di:waypoint x="545" y="100"/><di:waypoint x="818" y="100"/><di:waypoint x="818" y="282"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_markFailVal_onComplete" bpmnElement="flow_markFailedValidation_to_onComplete">
+        <di:waypoint x="720" y="200"/><di:waypoint x="760" y="200"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_onCompleteVF_end" bpmnElement="flow_onCompleteValidFail_to_end">
+        <di:waypoint x="880" y="200"/><di:waypoint x="932" y="200"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_waitTx_sendTx" bpmnElement="flow_waitTx_to_sendTxKafka">
+        <di:waypoint x="836" y="300"/><di:waypoint x="880" y="300"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_sendTx_cmdGw" bpmnElement="flow_sendTxKafka_to_commandGw">
+        <di:waypoint x="1000" y="300"/><di:waypoint x="1055" y="300"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_cmdGw_cancel" bpmnElement="flow_commandGw_cancel">
+        <di:waypoint x="1080" y="275"/><di:waypoint x="1080" y="200"/><di:waypoint x="1160" y="200"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_cmdGw_complete" bpmnElement="flow_commandGw_complete">
+        <di:waypoint x="1080" y="275"/><di:waypoint x="1080" y="40"/><di:waypoint x="1220" y="40"/><di:waypoint x="1220" y="60"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_cmdGw_update" bpmnElement="flow_commandGw_update">
+        <di:waypoint x="1080" y="325"/><di:waypoint x="1080" y="435"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_markFailCancel_onComplete" bpmnElement="flow_markFailedCancel_to_onComplete">
+        <di:waypoint x="1280" y="200"/><di:waypoint x="1320" y="200"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_onCompleteCancel_end" bpmnElement="flow_onCompleteCancel_to_end">
+        <di:waypoint x="1440" y="200"/><di:waypoint x="1492" y="200"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_markCompleteCmd_onComplete" bpmnElement="flow_markCompleteCmd_to_onComplete">
+        <di:waypoint x="1280" y="100"/><di:waypoint x="1320" y="100"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_onCompleteComplete_end" bpmnElement="flow_onCompleteComplete_to_end">
+        <di:waypoint x="1440" y="100"/><di:waypoint x="1492" y="100"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_txFailed_failed" bpmnElement="flow_txFailedGw_failed">
+        <di:waypoint x="1105" y="460"/><di:waypoint x="1220" y="460"/><di:waypoint x="1220" y="480"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_txFailed_notFailed" bpmnElement="flow_txFailedGw_notFailed">
+        <di:waypoint x="1055" y="460"/><di:waypoint x="825" y="460"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_markFailedTx_onComplete" bpmnElement="flow_markFailedTx_to_onComplete">
+        <di:waypoint x="1280" y="520"/><di:waypoint x="1320" y="520"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_onCompleteTxFailed_end" bpmnElement="flow_onCompleteTxFailed_to_end">
+        <di:waypoint x="1440" y="520"/><di:waypoint x="1492" y="520"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_updateResult_complete" bpmnElement="flow_updateResultGw_successComplete">
+        <di:waypoint x="775" y="460"/><di:waypoint x="720" y="460"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_updateResult_inProgress" bpmnElement="flow_updateResultGw_successInProgress">
+        <di:waypoint x="775" y="460"/><di:waypoint x="740" y="460"/><di:waypoint x="740" y="300"/><di:waypoint x="800" y="300"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_markCompleteUpdate_onComplete" bpmnElement="flow_markCompleteUpdate_to_onComplete">
+        <di:waypoint x="600" y="460"/><di:waypoint x="580" y="460"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="e_onCompleteUpdate_end" bpmnElement="flow_onCompleteUpdate_to_end">
+        <di:waypoint x="460" y="460"/><di:waypoint x="378" y="460"/>
+      </bpmndi:BPMNEdge>
 
     </bpmndi:BPMNPlane>
   </bpmndi:BPMNDiagram>
