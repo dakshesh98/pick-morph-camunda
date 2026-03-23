@@ -1,24 +1,21 @@
 package com.temporallearn.spring_temporal.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.temporallearn.spring_temporal.dto.Order;
-import com.temporallearn.spring_temporal.dto.OrderLine;
 import com.temporallearn.spring_temporal.dto.PickInstruction;
 import com.temporallearn.spring_temporal.dto.TransactionUpdate;
-import com.temporallearn.spring_temporal.dto.UpdatePickInstructionDto;
-import com.temporallearn.spring_temporal.dto.UpdatePickInstructionResult;
+import com.temporallearn.spring_temporal.dto.ae.PickListRequest;
 import com.temporallearn.spring_temporal.grpc.ButlerCoreGrpcClient;
 import com.temporallearn.spring_temporal.model.TransactionStatus;
 import com.temporallearn.spring_temporal.repository.TransactionStatusRepository;
 import com.greyorange.butler.core.grpc.GetPickInstructionStatusResponse;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -34,117 +31,35 @@ public class PickInstructionService {
     private final ButlerCoreGrpcClient butlerCoreGrpcClient;
     private final TransactionStatusRepository transactionStatusRepository;
     private final ObjectMapper objectMapper;
+    private final PickListRequestMapper pickListRequestMapper;
 
-    private static final int UPDATE_MAX_RETRIES = 3;
-    private static final long RETRY_BASE_DELAY_MS = 1000L;
+    @Value("${kafka.topic.pick-list-requests}")
+    private String pickListRequestsTopic;
+
+    @Value("${kafka.topic.item-picked-events}")
+    private String itemPickedEventsTopic;
 
     public PickInstructionService(KafkaTemplate<String, Object> kafkaTemplate,
                                   ButlerCoreGrpcClient butlerCoreGrpcClient,
                                   TransactionStatusRepository transactionStatusRepository,
-                                  ObjectMapper objectMapper) {
+                                  ObjectMapper objectMapper,
+                                  PickListRequestMapper pickListRequestMapper) {
         this.kafkaTemplate = kafkaTemplate;
         this.butlerCoreGrpcClient = butlerCoreGrpcClient;
         this.transactionStatusRepository = transactionStatusRepository;
         this.objectMapper = objectMapper;
+        this.pickListRequestMapper = pickListRequestMapper;
     }
 
     /**
-     * Transform PickInstruction to Order and publish to Kafka.
+     * Step 2 — Transforms PickInstruction into a PickListRequest and sends it to AE
+     * via gor.pick-list.requests. AE will respond on gor.pick-list.response (Step 3).
+     * Also called on RETRY to re-send after a retriable failure.
      */
-    public void publishOrderToKafka(PickInstruction pi) {
-        Order order = new Order();
-        order.setOrderId(pi.getPickId());
-        OrderLine line = new OrderLine();
-        line.setPickInstructionId(pi.getPickId());
-        line.setItem(pi.getItem());
-        line.setQty(pi.getQty());
-        line.setUom(pi.getUom());
-        line.setScannableBarcodes(pi.getScannableBarcodes());
-        line.setPickLocation(pi.getPickLocation());
-        line.setDropLocation(pi.getDropLocation());
-        order.setOrderLines(List.of(line));
-
-        kafkaTemplate.send("orders-topic", order.getOrderId(), order);
-        log.info("Published Order to Kafka: {}", order.getOrderId());
-    }
-
-    /**
-     * Update pick instruction via Butler Core gRPC, with retry and duplicate detection.
-     */
-    public UpdatePickInstructionResult updatePickInstruction(UpdatePickInstructionDto dto) {
-        log.info("Updating pick instruction via Butler Core gRPC - orderId: {}, transactionId: {}",
-                dto.getOrderId(), dto.getTransactionId());
-
-        String txId = dto.getTransactionId();
-        int attempt = 0;
-        UpdatePickInstructionResult result = UpdatePickInstructionResult.permanentError("UNKNOWN", "No result");
-
-        while (true) {
-            attempt++;
-            result = butlerCoreGrpcClient.updatePickInstruction(dto);
-
-            log.info("Pick instruction update result - orderId: {}, status: {}, success: {}, retriable: {}, errorCode: {}",
-                    dto.getOrderId(), result.getStatus(), result.isSuccess(),
-                    result.isRetriable(), result.getErrorCode());
-
-            if (result.isSuccess()) {
-                persistTransactionStatus(txId, dto.getOrderId(), "SUCCESS");
-                return result;
-            }
-
-            // Duplicate / already-exists → treat as success
-            String errorCode = result.getErrorCode();
-            String message = result.getMessage() != null ? result.getMessage().toLowerCase() : "";
-            if ("ALREADY_EXISTS".equalsIgnoreCase(errorCode)
-                    || message.contains("duplicate")
-                    || message.contains("already exists")) {
-                log.warn("Butler Core indicates duplicate transaction (treated as success) - txId: {}", txId);
-                persistTransactionStatus(txId, dto.getOrderId(), "SUCCESS");
-                return UpdatePickInstructionResult.ok("SUCCESS", "Duplicate treated as success: " + result.getMessage());
-            }
-
-            // Retriable and attempts remain → back off and retry
-            if (result.isRetriable() && attempt <= UPDATE_MAX_RETRIES) {
-                long backoff = RETRY_BASE_DELAY_MS * (1L << (attempt - 1));
-                log.warn("Retriable error from Butler Core — attempt {}/{}; backing off {} ms; txId: {}. Error: {}",
-                        attempt, UPDATE_MAX_RETRIES, backoff, txId, result.getMessage());
-                try {
-                    Thread.sleep(backoff);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    log.warn("Interrupted while backing off before retry", ie);
-                    break;
-                }
-                continue;
-            }
-
-            // Permanent failure or retries exhausted
-            persistTransactionStatus(txId, dto.getOrderId(), "FAILED");
-            break;
-        }
-
-        return result;
-    }
-
-    /**
-     * Check whether a pick instruction is already complete via Butler Core.
-     */
-    public boolean isPickInstructionComplete(String pickId) {
-        log.info("Checking pick instruction completion status - pickId: {}", pickId);
-        try {
-            GetPickInstructionStatusResponse statusResponse = butlerCoreGrpcClient.getPickInstructionStatus(pickId);
-            log.info("Pick instruction status - pickId: {}, status: {}, isComplete: {}, totalQty: {}, processedQty: {}, remainingQty: {}",
-                    pickId,
-                    statusResponse.getStatus(),
-                    statusResponse.getIsComplete(),
-                    statusResponse.getTotalQty(),
-                    statusResponse.getProcessedQty(),
-                    statusResponse.getRemainingQty());
-            return statusResponse.getIsComplete();
-        } catch (Exception e) {
-            log.error("Failed to check pick instruction status - pickId: {}", pickId, e);
-            throw new RuntimeException("Failed to get pick instruction status: " + e.getMessage(), e);
-        }
+    public void sendPicklistOrderToAE(PickInstruction pi) {
+        PickListRequest request = pickListRequestMapper.toPickListRequest(pi);
+        kafkaTemplate.send(pickListRequestsTopic, pi.getPickId(), request);
+        log.info("Sent PickListRequest to AE topic '{}' for pickId: {}", pickListRequestsTopic, pi.getPickId());
     }
 
     /**
@@ -166,97 +81,56 @@ public class PickInstructionService {
     }
 
     /**
-     * Send transaction details to Kafka for downstream consumers.
+     * Publishes a TransactionUpdate to gor.item-picked-events (consumed by Butler Core).
+     * Called by SendItemPickedEventDelegate after the DB commit gate in validateAndPersist().
      */
-    public void sendTransactionKafkaEvent(TransactionUpdate transactionUpdate) {
-        log.info("Sending transaction event to Kafka for pickId: {}, transactionId: {}",
-                transactionUpdate.getPickId(), transactionUpdate.getTransactionId());
-        kafkaTemplate.send("transaction-events-topic",
-                transactionUpdate.getPickId(),
-                transactionUpdate);
-        log.info("Published Transaction Event to Kafka: {}", transactionUpdate.getTransactionId());
+    public void sendItemPickedEvent(TransactionUpdate transactionUpdate) {
+        log.info("Sending item picked event to '{}' for pickId: {}, transactionId: {}",
+                itemPickedEventsTopic, transactionUpdate.getPickId(), transactionUpdate.getTransactionId());
+        kafkaTemplate.send(itemPickedEventsTopic, transactionUpdate.getPickId(), transactionUpdate);
+        log.info("Item picked event sent for transactionId: {}", transactionUpdate.getTransactionId());
     }
 
     /**
-     * Process the transaction update — duplicate detection, in-progress tracking, completion check.
-     * Returns true if the pick is now complete.
+     * Validates and persists a transaction update. This is the commit gate — Kafka publishing
+     * must only happen after this succeeds.
+     *
+     * Steps:
+     *   1. Duplicate check — if transactionId is already recorded as SUCCESS in DB, skip.
+     *   2. Persist to transaction_status with status SUCCESS.
+     *   3. Return whether the pick is now complete.
+     *
+     * @return Optional.empty()   if this is a duplicate — caller must NOT publish to Kafka.
+     *         Optional.of(true)  if persisted and pick is now complete.
+     *         Optional.of(false) if persisted and pick is still in progress.
      */
-    public boolean processTransactionUpdate(String pickId, TransactionUpdate transactionUpdate) {
-        log.info("Processing transaction update for pickId: {}, transactionId: {}, type: {}",
-                pickId, transactionUpdate.getTransactionId(), transactionUpdate.getTransactionType());
-
+    public Optional<Boolean> validateAndPersist(String pickId, TransactionUpdate transactionUpdate) {
         String txId = transactionUpdate.getTransactionId();
 
+        log.info("Validating transaction for pickId: {}, transactionId: {}, status: {}",
+                pickId, txId, transactionUpdate.getStatus());
+
+        // Step 1 — duplicate check
         if (txId != null && !txId.isEmpty()) {
             try {
                 Optional<TransactionStatus> existing = transactionStatusRepository.findById(txId);
-                if (existing.isPresent()) {
-                    String status = existing.get().getStatus();
-                    if ("SUCCESS".equals(status)) {
-                        log.info("Duplicate transaction detected (persisted) - ignoring txId: {} for pickId: {}", txId, pickId);
-                        return "COMPLETED".equalsIgnoreCase(transactionUpdate.getStatus());
-                    }
-                    if ("IN_PROGRESS".equals(status)) {
-                        log.info("Transaction already in progress (persisted) - txId: {} for pickId: {}", txId, pickId);
-                    }
+                if (existing.isPresent() && "SUCCESS".equals(existing.get().getStatus())) {
+                    log.warn("Duplicate transaction — txId: {} for pickId: {} already recorded as SUCCESS. Skipping.",
+                            txId, pickId);
+                    return Optional.empty();
                 }
             } catch (Exception e) {
-                log.warn("Failed to read persisted transaction status for txId: {} — falling back to processing", txId, e);
-            }
-            persistTransactionStatus(txId, pickId, "IN_PROGRESS");
-        }
-
-        int attempts = 0;
-        int maxAttempts = 3;
-        while (true) {
-            attempts++;
-            try {
-                boolean isComplete = "COMPLETED".equalsIgnoreCase(transactionUpdate.getStatus());
-                persistTransactionStatus(txId, pickId, "SUCCESS");
-                log.info("Transaction processed for PI: {}, Status: {}, Complete: {}",
-                        pickId, transactionUpdate.getStatus(), isComplete);
-                return isComplete;
-            } catch (Exception e) {
-                log.warn("Error processing transaction update for pickId: {}, txId: {}, attempt: {}",
-                        pickId, txId, attempts, e);
-                if (attempts >= maxAttempts) {
-                    log.error("Exceeded max attempts processing transaction update for pickId: {}, txId: {}", pickId, txId);
-                    persistTransactionStatus(txId, pickId, "FAILED");
-                    try {
-                        markFailureInButlerCore(pickId, "PROCESSING_FAILED", e.getMessage());
-                    } catch (Exception ignore) {
-                        log.warn("Failed to notify Butler Core of processing failure for pickId: {}", pickId, ignore);
-                    }
-                    return false;
-                }
-                try {
-                    Thread.sleep(500L * attempts);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    log.warn("Interrupted during processing backoff", ie);
-                    persistTransactionStatus(txId, pickId, "FAILED");
-                    return false;
-                }
+                log.warn("Failed to check existing transaction status for txId: {} — proceeding with persist", txId, e);
             }
         }
-    }
 
-    /**
-     * Notify Butler Core of a processing failure for this pick instruction.
-     */
-    public void markFailureInButlerCore(String pickId, String errorCode, String errorMessage) {
-        log.error("Marking failure in Butler Core for pickId: {}, errorCode: {}, errorMessage: {}",
-                pickId, errorCode, errorMessage);
-        try {
-            UpdatePickInstructionDto failureDto = UpdatePickInstructionDto.builder()
-                    .orderId(pickId)
-                    .build();
-            UpdatePickInstructionResult result = butlerCoreGrpcClient.updatePickInstruction(failureDto);
-            log.info("Butler Core failure notification result for pickId: {} — status: {}, success: {}",
-                    pickId, result.getStatus(), result.isSuccess());
-        } catch (Exception e) {
-            log.warn("Failed to notify Butler Core of failure for pickId: {}. Non-critical.", pickId, e);
-        }
+        // Step 2 — persist to DB (commit point; primary key constraint guards against races)
+        persistTransactionStatus(txId, pickId, "SUCCESS");
+
+        // Step 3 — completion check
+        boolean txComplete = "COMPLETED".equalsIgnoreCase(transactionUpdate.getStatus());
+        log.info("Transaction persisted for pickId: {}, txId: {}, txComplete: {}", pickId, txId, txComplete);
+        return Optional.of(txComplete);
     }
 
     /**
@@ -321,7 +195,7 @@ public class PickInstructionService {
         log.info("Workflow cleanup complete for pickId: {} — final status: {}", pickId, internalStatus);
     }
 
-    // ─── Internal helper ────────────────────────────────────────────────────
+    // ─── Internal helpers ────────────────────────────────────────────────────
 
     private void persistTransactionStatus(String txId, String pickId, String status) {
         if (txId == null || txId.isEmpty()) {

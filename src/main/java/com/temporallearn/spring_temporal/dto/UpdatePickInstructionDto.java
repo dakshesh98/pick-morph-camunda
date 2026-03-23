@@ -10,7 +10,7 @@ import java.util.List;
 /**
  * DTO mirroring the UpdatePickInstructionRequest proto message.
  * Used to pass pick instruction update data from the activity layer
- * to the gRPC client without exposing protobuf types.
+ * to the gRPC client/Kafka without exposing protobuf types.
  */
 @Data
 @Builder

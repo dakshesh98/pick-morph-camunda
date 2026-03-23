@@ -11,8 +11,8 @@
   <!-- ═══════════════════════════════════════════════════
        Message definitions for intermediate catch events
        ═══════════════════════════════════════════════════ -->
-  <message id="Message_ValidationResult" name="ValidationResultMessage"/>
-  <message id="Message_TransactionUpdate" name="TransactionUpdateMessage"/>
+  <message id="Message_PickListResponse" name="PickListResponseMessage"/>
+  <message id="Message_ItemPickingEvent" name="ItemPickingEventMessage"/>
 
   <!-- ═══════════════════════════════════════════════════
        Main Process
@@ -27,7 +27,7 @@
     <!-- ─── Publish Order to Kafka ─── -->
     <serviceTask id="publishOrderTask"
                  name="Publish Order to Kafka"
-                 camunda:delegateExpression="${publishOrderToKafkaDelegate}">
+                 camunda:delegateExpression="${sendPickListToAEDelegate}">
       <incoming>flow_start_to_publishOrder</incoming>
       <outgoing>flow_publishOrder_to_waitValidation</outgoing>
     </serviceTask>
@@ -36,14 +36,14 @@
     <intermediateCatchEvent id="waitForValidation" name="Wait for Validation">
       <incoming>flow_publishOrder_to_waitValidation</incoming>
       <outgoing>flow_waitValidation_to_validationGw</outgoing>
-      <messageEventDefinition id="MsgDef_validation" messageRef="Message_ValidationResult"/>
+      <messageEventDefinition id="MsgDef_validation" messageRef="Message_PickListResponse"/>
     </intermediateCatchEvent>
 
     <!-- ─── Validation Gateway ─── -->
-    <exclusiveGateway id="validationGateway" name="Validation OK?" default="flow_validationGw_to_checkComplete">
+    <exclusiveGateway id="validationGateway" name="Validation OK?" default="flow_validationGw_to_waitTx">
       <incoming>flow_waitValidation_to_validationGw</incoming>
       <outgoing>flow_validationGw_failed</outgoing>
-      <outgoing>flow_validationGw_to_checkComplete</outgoing>
+      <outgoing>flow_validationGw_to_waitTx</outgoing>
     </exclusiveGateway>
 
     <!-- ─── [FAIL PATH] Set status FAILED for validation failure ─── -->
@@ -65,54 +65,19 @@
       <incoming>flow_onCompleteValidFail_to_end</incoming>
     </endEvent>
 
-    <!-- ─── Check if Pick Instruction Already Complete ─── -->
-    <serviceTask id="checkCompleteTask"
-                 name="Check PI Complete?"
-                 camunda:delegateExpression="${checkPickInstructionCompleteDelegate}">
-      <incoming>flow_validationGw_to_checkComplete</incoming>
-      <outgoing>flow_checkComplete_to_alreadyCompleteGw</outgoing>
-    </serviceTask>
-
-    <!-- ─── Already Complete Gateway ─── -->
-    <exclusiveGateway id="isAlreadyCompleteGateway" name="Already Complete?" default="flow_alreadyCompleteGw_to_waitTx">
-      <incoming>flow_checkComplete_to_alreadyCompleteGw</incoming>
-      <outgoing>flow_alreadyCompleteGw_yes</outgoing>
-      <outgoing>flow_alreadyCompleteGw_to_waitTx</outgoing>
-    </exclusiveGateway>
-
-    <!-- ─── [EARLY COMPLETE PATH] Mark complete early ─── -->
-    <serviceTask id="markCompleteEarly"
-                 name="Mark PI Complete (Early)"
-                 camunda:delegateExpression="${markPickInstructionCompleteDelegate}">
-      <incoming>flow_alreadyCompleteGw_yes</incoming>
-      <outgoing>flow_markCompleteEarly_to_onComplete</outgoing>
-    </serviceTask>
-
-    <serviceTask id="onWorkflowCompleteEarly"
-                 name="On Workflow Complete (Early)"
-                 camunda:delegateExpression="${onWorkflowCompleteDelegate}">
-      <incoming>flow_markCompleteEarly_to_onComplete</incoming>
-      <outgoing>flow_onCompleteEarly_to_end</outgoing>
-    </serviceTask>
-
-    <endEvent id="endAlreadyComplete" name="End (Already Complete)">
-      <incoming>flow_onCompleteEarly_to_end</incoming>
-    </endEvent>
-
     <!-- ─── Wait for Transaction Update (Message Catch — loops back here) ─── -->
     <intermediateCatchEvent id="waitForTransactionUpdate" name="Wait for Transaction Update">
-      <incoming>flow_alreadyCompleteGw_to_waitTx</incoming>
+      <incoming>flow_validationGw_to_waitTx</incoming>
       <incoming>flow_republishRetry_to_waitTx</incoming>
       <incoming>flow_updateInProgress_to_waitTx</incoming>
-      <incoming>flow_republishRetriable_to_waitTx</incoming>
       <outgoing>flow_waitTx_to_sendTxKafka</outgoing>
-      <messageEventDefinition id="MsgDef_txUpdate" messageRef="Message_TransactionUpdate"/>
+      <messageEventDefinition id="MsgDef_txUpdate" messageRef="Message_ItemPickingEvent"/>
     </intermediateCatchEvent>
 
     <!-- ─── Send Transaction Kafka Event ─── -->
     <serviceTask id="sendTransactionKafkaTask"
                  name="Send Transaction Kafka Event"
-                 camunda:delegateExpression="${sendTransactionKafkaEventDelegate}">
+                 camunda:delegateExpression="${sendItemPickedEventDelegate}">
       <incoming>flow_waitTx_to_sendTxKafka</incoming>
       <outgoing>flow_sendTxKafka_to_commandGw</outgoing>
     </serviceTask>
@@ -167,7 +132,7 @@
     <!-- ─── [RETRY PATH] Republish to Kafka and loop back ─── -->
     <serviceTask id="republishRetry"
                  name="Republish Order (Retry)"
-                 camunda:delegateExpression="${publishOrderToKafkaDelegate}">
+                 camunda:delegateExpression="${sendPickListToAEDelegate}">
       <incoming>flow_commandGw_retry</incoming>
       <outgoing>flow_republishRetry_to_waitTx</outgoing>
     </serviceTask>
@@ -198,21 +163,11 @@
       <incoming>flow_onCompleteTxFailed_to_end</incoming>
     </endEvent>
 
-    <!-- ─── Update Pick Instruction ─── -->
-    <serviceTask id="updatePickInstructionTask"
-                 name="Update Pick Instruction"
-                 camunda:delegateExpression="${updatePickInstructionDelegate}">
-      <incoming>flow_txFailedGw_notFailed</incoming>
-      <outgoing>flow_updatePI_to_updateResultGw</outgoing>
-    </serviceTask>
-
     <!-- ─── Update Result Gateway ─── -->
     <exclusiveGateway id="updateResultGateway" name="Update Result?" default="flow_updateResultGw_successInProgress">
-      <incoming>flow_updatePI_to_updateResultGw</incoming>
+      <incoming>flow_txFailedGw_notFailed</incoming>
       <outgoing>flow_updateResultGw_successComplete</outgoing>
       <outgoing>flow_updateResultGw_successInProgress</outgoing>
-      <outgoing>flow_updateResultGw_retriable</outgoing>
-      <outgoing>flow_updateResultGw_nonRetriable</outgoing>
     </exclusiveGateway>
 
     <!-- ─── [SUCCESS + COMPLETE PATH] ─── -->
@@ -232,40 +187,6 @@
 
     <endEvent id="endUpdateComplete" name="End (Update Complete)">
       <incoming>flow_onCompleteUpdate_to_end</incoming>
-    </endEvent>
-
-    <!-- ─── [RETRIABLE ERROR PATH] Republish and loop back ─── -->
-    <serviceTask id="republishRetriable"
-                 name="Republish Order (Retriable Error)"
-                 camunda:delegateExpression="${publishOrderToKafkaDelegate}">
-      <incoming>flow_updateResultGw_retriable</incoming>
-      <outgoing>flow_republishRetriable_to_waitTx</outgoing>
-    </serviceTask>
-
-    <!-- ─── [NON-RETRIABLE ERROR PATH] ─── -->
-    <serviceTask id="markFailedNR"
-                 name="Mark Failed (Non-Retriable)"
-                 camunda:delegateExpression="${markPickInstructionFailedDelegate}">
-      <incoming>flow_updateResultGw_nonRetriable</incoming>
-      <outgoing>flow_markFailedNR_to_butlerCore</outgoing>
-    </serviceTask>
-
-    <serviceTask id="markFailureButlerCore"
-                 name="Mark Failure in Butler Core"
-                 camunda:delegateExpression="${markFailureInButlerCoreDelegate}">
-      <incoming>flow_markFailedNR_to_butlerCore</incoming>
-      <outgoing>flow_butlerCore_to_onComplete</outgoing>
-    </serviceTask>
-
-    <serviceTask id="onWorkflowCompleteNR"
-                 name="On Workflow Complete (Non-Retriable)"
-                 camunda:delegateExpression="${onWorkflowCompleteDelegate}">
-      <incoming>flow_butlerCore_to_onComplete</incoming>
-      <outgoing>flow_onCompleteNR_to_end</outgoing>
-    </serviceTask>
-
-    <endEvent id="endNonRetriable" name="End (Non-Retriable Error)">
-      <incoming>flow_onCompleteNR_to_end</incoming>
     </endEvent>
 
     <!-- ════════════════════════════════════════════
@@ -294,10 +215,10 @@
       <conditionExpression xsi:type="tFormalExpression">${validationSuccess == false}</conditionExpression>
     </sequenceFlow>
 
-    <!-- Validation Gateway → Check Complete (default: validationSuccess == true) -->
-    <sequenceFlow id="flow_validationGw_to_checkComplete"
+    <!-- Validation Gateway → Wait for TX Update (default: validationSuccess == true) -->
+    <sequenceFlow id="flow_validationGw_to_waitTx"
                   sourceRef="validationGateway"
-                  targetRef="checkCompleteTask"/>
+                  targetRef="waitForTransactionUpdate"/>
 
     <!-- Mark Failed (Validation) → On Workflow Complete (Validation Failed) -->
     <sequenceFlow id="flow_markFailedValidation_to_onComplete"
@@ -308,33 +229,6 @@
     <sequenceFlow id="flow_onCompleteValidFail_to_end"
                   sourceRef="onWorkflowCompleteValidationFailed"
                   targetRef="endValidationFailed"/>
-
-    <!-- Check Complete → Already Complete Gateway -->
-    <sequenceFlow id="flow_checkComplete_to_alreadyCompleteGw"
-                  sourceRef="checkCompleteTask"
-                  targetRef="isAlreadyCompleteGateway"/>
-
-    <!-- Already Complete Gateway → Mark Complete Early (isAlreadyComplete == true) -->
-    <sequenceFlow id="flow_alreadyCompleteGw_yes"
-                  sourceRef="isAlreadyCompleteGateway"
-                  targetRef="markCompleteEarly">
-      <conditionExpression xsi:type="tFormalExpression">${isAlreadyComplete == true}</conditionExpression>
-    </sequenceFlow>
-
-    <!-- Already Complete Gateway → Wait for TX Update (default: isAlreadyComplete == false) -->
-    <sequenceFlow id="flow_alreadyCompleteGw_to_waitTx"
-                  sourceRef="isAlreadyCompleteGateway"
-                  targetRef="waitForTransactionUpdate"/>
-
-    <!-- Mark Complete Early → On Workflow Complete (Early) -->
-    <sequenceFlow id="flow_markCompleteEarly_to_onComplete"
-                  sourceRef="markCompleteEarly"
-                  targetRef="onWorkflowCompleteEarly"/>
-
-    <!-- On Workflow Complete (Early) → End -->
-    <sequenceFlow id="flow_onCompleteEarly_to_end"
-                  sourceRef="onWorkflowCompleteEarly"
-                  targetRef="endAlreadyComplete"/>
 
     <!-- Wait for TX Update → Send Transaction Kafka Event -->
     <sequenceFlow id="flow_waitTx_to_sendTxKafka"
@@ -404,10 +298,10 @@
       <conditionExpression xsi:type="tFormalExpression">${txStatus == 'FAILED'}</conditionExpression>
     </sequenceFlow>
 
-    <!-- TX Failed Gateway → Update PI (default: txStatus != FAILED) -->
+    <!-- TX Failed Gateway → Update Result Gateway (default: txStatus != FAILED) -->
     <sequenceFlow id="flow_txFailedGw_notFailed"
                   sourceRef="txFailedGateway"
-                  targetRef="updatePickInstructionTask"/>
+                  targetRef="updateResultGateway"/>
 
     <!-- Mark Failed (TX Failed) → On Workflow Complete (TX Failed) -->
     <sequenceFlow id="flow_markFailedTx_to_onComplete"
@@ -419,36 +313,17 @@
                   sourceRef="onWorkflowCompleteTxFailed"
                   targetRef="endTxFailed"/>
 
-    <!-- Update PI → Update Result Gateway -->
-    <sequenceFlow id="flow_updatePI_to_updateResultGw"
-                  sourceRef="updatePickInstructionTask"
-                  targetRef="updateResultGateway"/>
-
-    <!-- Update Result Gateway → Success + Complete (updateSuccess && txComplete) -->
+    <!-- Update Result Gateway → Success + Complete (txComplete) -->
     <sequenceFlow id="flow_updateResultGw_successComplete"
                   sourceRef="updateResultGateway"
                   targetRef="markCompleteUpdate">
-      <conditionExpression xsi:type="tFormalExpression">${updateSuccess == true and txComplete == true}</conditionExpression>
+      <conditionExpression xsi:type="tFormalExpression">${txComplete == true}</conditionExpression>
     </sequenceFlow>
 
-    <!-- Update Result Gateway → Success + In-Progress (default: updateSuccess && !txComplete) — loop back -->
+    <!-- Update Result Gateway → In-Progress (default: txComplete == false) — loop back -->
     <sequenceFlow id="flow_updateResultGw_successInProgress"
                   sourceRef="updateResultGateway"
                   targetRef="waitForTransactionUpdate"/>
-
-    <!-- Update Result Gateway → Retriable error (!updateSuccess && updateRetriable) -->
-    <sequenceFlow id="flow_updateResultGw_retriable"
-                  sourceRef="updateResultGateway"
-                  targetRef="republishRetriable">
-      <conditionExpression xsi:type="tFormalExpression">${updateSuccess == false and updateRetriable == true}</conditionExpression>
-    </sequenceFlow>
-
-    <!-- Update Result Gateway → Non-retriable error (!updateSuccess && !updateRetriable) -->
-    <sequenceFlow id="flow_updateResultGw_nonRetriable"
-                  sourceRef="updateResultGateway"
-                  targetRef="markFailedNR">
-      <conditionExpression xsi:type="tFormalExpression">${updateSuccess == false and updateRetriable == false}</conditionExpression>
-    </sequenceFlow>
 
     <!-- Mark Complete (Update) → On Workflow Complete (Update Complete) -->
     <sequenceFlow id="flow_markCompleteUpdate_to_onComplete"
@@ -459,26 +334,6 @@
     <sequenceFlow id="flow_onCompleteUpdate_to_end"
                   sourceRef="onWorkflowCompleteUpdate"
                   targetRef="endUpdateComplete"/>
-
-    <!-- Republish (Retriable) → loop back to Wait for TX Update -->
-    <sequenceFlow id="flow_republishRetriable_to_waitTx"
-                  sourceRef="republishRetriable"
-                  targetRef="waitForTransactionUpdate"/>
-
-    <!-- Mark Failed (NR) → Mark Failure in Butler Core -->
-    <sequenceFlow id="flow_markFailedNR_to_butlerCore"
-                  sourceRef="markFailedNR"
-                  targetRef="markFailureButlerCore"/>
-
-    <!-- Mark Failure in Butler Core → On Workflow Complete (NR) -->
-    <sequenceFlow id="flow_butlerCore_to_onComplete"
-                  sourceRef="markFailureButlerCore"
-                  targetRef="onWorkflowCompleteNR"/>
-
-    <!-- On Workflow Complete (NR) → End -->
-    <sequenceFlow id="flow_onCompleteNR_to_end"
-                  sourceRef="onWorkflowCompleteNR"
-                  targetRef="endNonRetriable"/>
 
     <!-- ════════════════════════════════════════════
          LOOP-BACK: update in-progress → wait for next TX
@@ -520,26 +375,6 @@
 
       <bpmndi:BPMNShape id="endValidationFailed_di" bpmnElement="endValidationFailed">
         <dc:Bounds x="932" y="182" width="36" height="36"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="checkCompleteTask_di" bpmnElement="checkCompleteTask">
-        <dc:Bounds x="600" y="60" width="120" height="80"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="isAlreadyCompleteGateway_di" bpmnElement="isAlreadyCompleteGateway" isMarkerVisible="true">
-        <dc:Bounds x="775" y="75" width="50" height="50"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="markCompleteEarly_di" bpmnElement="markCompleteEarly">
-        <dc:Bounds x="880" y="60" width="120" height="80"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="onWorkflowCompleteEarly_di" bpmnElement="onWorkflowCompleteEarly">
-        <dc:Bounds x="1040" y="60" width="120" height="80"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="endAlreadyComplete_di" bpmnElement="endAlreadyComplete">
-        <dc:Bounds x="1212" y="82" width="36" height="36"/>
       </bpmndi:BPMNShape>
 
       <bpmndi:BPMNShape id="waitForTransactionUpdate_di" bpmnElement="waitForTransactionUpdate">
@@ -598,10 +433,6 @@
         <dc:Bounds x="1492" y="502" width="36" height="36"/>
       </bpmndi:BPMNShape>
 
-      <bpmndi:BPMNShape id="updatePickInstructionTask_di" bpmnElement="updatePickInstructionTask">
-        <dc:Bounds x="880" y="420" width="120" height="80"/>
-      </bpmndi:BPMNShape>
-
       <bpmndi:BPMNShape id="updateResultGateway_di" bpmnElement="updateResultGateway" isMarkerVisible="true">
         <dc:Bounds x="775" y="435" width="50" height="50"/>
       </bpmndi:BPMNShape>
@@ -616,26 +447,6 @@
 
       <bpmndi:BPMNShape id="endUpdateComplete_di" bpmnElement="endUpdateComplete">
         <dc:Bounds x="342" y="442" width="36" height="36"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="republishRetriable_di" bpmnElement="republishRetriable">
-        <dc:Bounds x="600" y="560" width="120" height="80"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="markFailedNR_di" bpmnElement="markFailedNR">
-        <dc:Bounds x="760" y="560" width="120" height="80"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="markFailureButlerCore_di" bpmnElement="markFailureButlerCore">
-        <dc:Bounds x="920" y="560" width="120" height="80"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="onWorkflowCompleteNR_di" bpmnElement="onWorkflowCompleteNR">
-        <dc:Bounds x="1080" y="560" width="120" height="80"/>
-      </bpmndi:BPMNShape>
-
-      <bpmndi:BPMNShape id="endNonRetriable_di" bpmnElement="endNonRetriable">
-        <dc:Bounds x="1252" y="582" width="36" height="36"/>
       </bpmndi:BPMNShape>
 
     </bpmndi:BPMNPlane>

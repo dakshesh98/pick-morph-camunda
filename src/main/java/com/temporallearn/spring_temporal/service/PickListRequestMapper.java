@@ -1,0 +1,123 @@
+package com.temporallearn.spring_temporal.service;
+
+import com.temporallearn.spring_temporal.dto.PickInstruction;
+import com.temporallearn.spring_temporal.dto.ae.PickListRequest;
+import org.springframework.stereotype.Component;
+
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Maps a {@link PickInstruction} (internal AA model) to a {@link PickListRequest}
+ * (AE contract wire format) for publishing to <tenant>.pick-list.requests.
+ *
+ * Field mapping rationale:
+ *   pickId          → externalServiceRequestId (single order per instruction)
+ *   dropLocation    → fulfillmentArea + destinationGroup (drop zone is the fulfilment destination)
+ *   tpid            → shipmentId (transport plan ID maps to AE shipment concept)
+ *   pickLocation    → location fields (raw address; AE parses sub-fields on their side)
+ *   scannableBarcodes → productAttributes.barcodes (LPN/marked-container barcodes)
+ *   item            → product_sku
+ *   qty             → productQuantity
+ *   binId           → bin_grouping_tag (used by AE for bin-level grouping)
+ */
+@Component
+public class PickListRequestMapper {
+
+    public PickListRequest toPickListRequest(PickInstruction pi) {
+        return PickListRequest.builder()
+                .externalServiceRequestId(pi.getPickId())
+                .type("PICK")
+                .fulfillmentArea(List.of(pi.getDropLocation()))
+                .attributes(buildTopLevelAttributes(pi))
+                .serviceRequests(List.of(buildServiceRequest(pi)))
+                .build();
+    }
+
+    // ── Private builders ─────────────────────────────────────────────────────
+
+    private PickListRequest.TopLevelAttributes buildTopLevelAttributes(PickInstruction pi) {
+        return PickListRequest.TopLevelAttributes.builder()
+                .skipStandardPickProcess(false)
+                .simplePriority("NORMAL")
+                .orderOptions(buildOrderOptions(pi))
+                .build();
+    }
+
+    private PickListRequest.OrderOptions buildOrderOptions(PickInstruction pi) {
+        return PickListRequest.OrderOptions.builder()
+                .customerOrderInfo(PickListRequest.CustomerOrderInfo.builder()
+                        .orderId(pi.getPickId())
+                        .orderLineId(pi.getPickId())
+                        .masterOrderId(pi.getPickId())
+                        .shipmentId(pi.getTpid())
+                        .build())
+                .palletization(false)
+                .orderClubbing(false)
+                .orderSplitting(false)
+                .orderlineSplitting(false)
+                .groupingTags(PickListRequest.GroupingTags.builder()
+                        .missionGrouningTag(pi.getPickId())
+                        .containerGroupingTag(pi.getBinId())
+                        .binGroupingTag(pi.getBinId())
+                        .build())
+                .bintags(Collections.emptyList())
+                .containerType("")
+                .destinationGroup(pi.getDropLocation())
+                .simplePriority("NORMAL")
+                .behaviours(Collections.emptyList())
+                .build();
+    }
+
+    private PickListRequest.ServiceRequest buildServiceRequest(PickInstruction pi) {
+        return PickListRequest.ServiceRequest.builder()
+                .externalServiceRequestId(pi.getPickId())
+                .type("PICK_LINE")
+                .attributes(buildServiceRequestAttributes(pi))
+                .expectations(buildExpectations(pi))
+                .build();
+    }
+
+    private PickListRequest.ServiceRequestAttributes buildServiceRequestAttributes(PickInstruction pi) {
+        return PickListRequest.ServiceRequestAttributes.builder()
+                .extraInfo(PickListRequest.ExtraInfo.builder()
+                        .clientTaskId(pi.getPickId())
+                        .build())
+                .shelfLifeHours(0)
+                .location(PickListRequest.Location.builder()
+                        .displayName(pi.getPickLocation())
+                        .fullAddress(pi.getPickLocation())
+                        .addressFields(PickListRequest.AddressFields.builder()
+                                .side(pi.getPickLocation())
+                                .zone(pi.getPickLocation())
+                                .level(pi.getPickLocation())
+                                .bay(pi.getPickLocation())
+                                .aisle(pi.getPickLocation())
+                                .build())
+                        .build())
+                .build();
+    }
+
+    private PickListRequest.Expectations buildExpectations(PickInstruction pi) {
+        PickListRequest.ProductAttributes productAttributes = PickListRequest.ProductAttributes.builder()
+                .lotId("")
+                .filterParameters(Collections.emptyList())
+                .barcodes(pi.getScannableBarcodes() != null ? pi.getScannableBarcodes() : Collections.emptyList())
+                .productSku(pi.getItem())
+                .packageParameters(Collections.emptyList())
+                .build();
+
+        PickListRequest.Product product = PickListRequest.Product.builder()
+                .productQuantity(pi.getQty())
+                .productAttributes(productAttributes)
+                .build();
+
+        PickListRequest.Container container = PickListRequest.Container.builder()
+                .products(List.of(product))
+                .build();
+
+        return PickListRequest.Expectations.builder()
+                .containers(List.of(container))
+                .build();
+    }
+}
