@@ -453,8 +453,12 @@ public class PickInstructionService {
                         .userLoggedIn(pi.getUserLoggedIn())
                         .ppsPoint(pi.getPpsPoint())
                         .isMarkedContainerFlow(pi.isMarkedContainerScanned())
-                        .transactionId(tx.getTransactionId())
+                        .transactionId(tx.getContainerAttributes() != null
+                                && tx.getContainerAttributes().getInternalOrderId() != null
+                                ? String.valueOf(tx.getContainerAttributes().getInternalOrderId())
+                                : tx.getTransactionId())
                         .state(tx.getTransactionState())
+                        .danglingArea("bot")
                         .pickedItemInfoList(List.of(itemInfo))
                         .build();
 
