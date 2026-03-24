@@ -12,6 +12,7 @@ import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -82,99 +83,99 @@ public class PickListEventListener {
         // Step 1 — update ae_order selectively (DB write before Camunda correlation)
         pickInstructionService.updateAeOrderFromEvent(event);
 
-        // Step 2 — map to internal TransactionUpdate and correlate Camunda signal
-        TransactionUpdate transactionUpdate = mapToTransactionUpdate(eventType, orderState, subState, pickId, eventPayload);
-
-        log.info("Mapped AE event to TransactionUpdate | pickId: {} | command: {} | status: {} | transactionId: {}",
-                pickId, transactionUpdate.getCommand(), transactionUpdate.getStatus(), transactionUpdate.getTransactionId());
-
-        correlateCamundaMessage(transactionUpdate, event, eventType, payload);
+        // Step 2 — correlate Camunda signal
+        // transactionUpdatesJson (JSON array) is only built and passed for pick_transaction events;
+        // other event types only need command + aeEventType to drive the gateway.
+        if ("pick_transaction".equalsIgnoreCase(eventType)) {
+            List<TransactionUpdate> updates = buildPickTransactionUpdates(pickId, eventPayload);
+            log.info("pick_transaction event | pickId: {} | transactions: {}", pickId, updates.size());
+            correlatePickTransaction(updates, payload, pickId);
+        } else {
+            String command = resolveCommand(eventType, orderState, subState);
+            log.info("AE update event | pickId: {} | command: {} | state: {} | sub_state: {}", pickId, command, orderState, subState);
+            correlateUpdateEvent(command, eventType, subState, pickId);
+        }
     }
 
     // ── State mapping ────────────────────────────────────────────────────────
 
-    private TransactionUpdate mapToTransactionUpdate(String eventType,
-                                                     String orderState,
-                                                     String subState,
-                                                     String pickId,
-                                                     PickListEvent.Payload payload) {
-        String command;
-        String status;
+    /**
+     * Builds one TransactionUpdate per (serviceRequest × transaction) for pick_transaction events.
+     * Each transaction needs its own idempotency check and ItemPickedEvent publish.
+     */
+    private List<TransactionUpdate> buildPickTransactionUpdates(String pickId, PickListEvent.Payload payload) {
+        List<TransactionUpdate> updates = new ArrayList<>();
+        if (payload.getServiceRequests() == null) return updates;
+        for (PickListEvent.ServiceRequest sr : payload.getServiceRequests()) {
+            if (sr.getTransactions() == null) continue;
+            for (PickListEvent.Transaction tx : sr.getTransactions()) {
+                updates.add(TransactionUpdate.builder()
+                        .pickId(pickId)
+                        .transactionId(tx.getTransactionId())
+                        .command("UPDATE")
+                        .transactionType("PICK")
+                        .processedQty(tx.getContainerAttributes() != null
+                                ? tx.getContainerAttributes().getQtyPicked() : 0)
+                        .status("IN_PROGRESS")
+                        .timestamp(Instant.now().toString())
+                        .build());
+            }
+        }
+        return updates;
+    }
 
-        if ("pick_transaction".equalsIgnoreCase(eventType)) {
-            command = "UPDATE";
-            status = "IN_PROGRESS";
-        } else if ("update".equalsIgnoreCase(eventType)
+    /** Resolves the Camunda command for non-pick_transaction (update) events. */
+    private String resolveCommand(String eventType, String orderState, String subState) {
+        if ("update".equalsIgnoreCase(eventType)
                 && "complete".equalsIgnoreCase(orderState)
                 && "complete".equalsIgnoreCase(subState)) {
-            command = "COMPLETE";
-            status = "COMPLETED";
-        } else {
-            command = "UPDATE";
-            status = "IN_PROGRESS";
+            return "COMPLETE";
         }
-
-        String transactionId = extractTransactionId(payload, pickId);
-        int processedQty = extractQtyPicked(payload);
-
-        return TransactionUpdate.builder()
-                .pickId(pickId)
-                .transactionId(transactionId)
-                .command(command)
-                .transactionType("PICK")
-                .processedQty(processedQty)
-                .status(status)
-                .timestamp(Instant.now().toString())
-                .additionalInfo(subState)
-                .build();
+        return "UPDATE";
     }
 
     // ── Camunda correlation ──────────────────────────────────────────────────
 
-    private void correlateCamundaMessage(TransactionUpdate transactionUpdate,
-                                         PickListEvent event,
-                                         String eventType,
-                                         String rawEventJson) {
+    /** Correlates a pick_transaction event — includes transactionUpdatesJson (array) and pickListEventJson. */
+    private void correlatePickTransaction(List<TransactionUpdate> updates, String rawEventJson, String pickId) {
         try {
-            String transactionUpdateJson = objectMapper.writeValueAsString(transactionUpdate);
-            String command = transactionUpdate.getCommand() != null
-                    ? transactionUpdate.getCommand().toUpperCase()
-                    : "UPDATE";
-
-            var correlation = runtimeService.createMessageCorrelation("ItemPickingEventMessage")
-                    .processInstanceVariableEquals("pickId", transactionUpdate.getPickId())
-                    .setVariable("command", command)
-                    .setVariable("txStatus", transactionUpdate.getStatus())
-                    .setVariable("transactionUpdateJson", transactionUpdateJson)
-                    .setVariable("transactionId", transactionUpdate.getTransactionId())
-                    .setVariable("failureReason", transactionUpdate.getAdditionalInfo());
-
-            // For pick_transaction events pass the full event JSON so the delegate can
-            // iterate all serviceRequests and publish one ItemPickedEvent per transaction
-            if ("pick_transaction".equalsIgnoreCase(eventType)) {
-                correlation.setVariable("pickListEventJson", rawEventJson);
-            }
-
-            correlation.correlate();
-
-            log.info("ItemPickingEventMessage correlated successfully for pickId: {} | command: {} | status: {}",
-                    transactionUpdate.getPickId(), command, transactionUpdate.getStatus());
-
+            String transactionUpdatesJson = objectMapper.writeValueAsString(updates);
+            runtimeService.createMessageCorrelation("ItemPickingEventMessage")
+                    .processInstanceVariableEquals("pickId", pickId)
+                    .setVariable("command", "UPDATE")
+                    .setVariable("aeEventType", "pick_transaction")
+                    .setVariable("transactionUpdatesJson", transactionUpdatesJson)
+                    .setVariable("pickListEventJson", rawEventJson)
+                    .correlate();
+            log.info("ItemPickingEventMessage correlated for pick_transaction | pickId: {} | transactions: {}",
+                    pickId, updates.size());
         } catch (MismatchingMessageCorrelationException e) {
-            log.error("No process instance found waiting for ItemPickingEventMessage for pickId: {}. " +
-                    "AE item picking event dropped. transactionId: {}",
-                    transactionUpdate.getPickId(), transactionUpdate.getTransactionId());
+            log.error("No process instance waiting for pickId: {} — pick_transaction event dropped", pickId);
         } catch (Exception e) {
-            log.error("Failed to correlate ItemPickingEventMessage for pickId: {} | error: {}",
-                    transactionUpdate.getPickId(), e.getMessage(), e);
+            log.error("Failed to correlate pick_transaction for pickId: {} | error: {}", pickId, e.getMessage(), e);
+        }
+    }
+
+    /** Correlates a non-pick_transaction (update) event — only command + aeEventType, no transactionUpdateJson. */
+    private void correlateUpdateEvent(String command, String eventType, String subState, String pickId) {
+        try {
+            runtimeService.createMessageCorrelation("ItemPickingEventMessage")
+                    .processInstanceVariableEquals("pickId", pickId)
+                    .setVariable("command", command)
+                    .setVariable("aeEventType", eventType)
+                    .setVariable("failureReason", subState)
+                    .correlate();
+            log.info("ItemPickingEventMessage correlated for update event | pickId: {} | command: {}", pickId, command);
+        } catch (MismatchingMessageCorrelationException e) {
+            log.error("No process instance waiting for pickId: {} — update event dropped", pickId);
+        } catch (Exception e) {
+            log.error("Failed to correlate update event for pickId: {} | error: {}", pickId, e.getMessage(), e);
         }
     }
 
     // ── Extraction helpers ───────────────────────────────────────────────────
 
-    /**
-     * Resolves event_type: headers.event_type first, then payload.attributes.event_type fallback.
-     */
+    /** Resolves event_type: headers.event_type first, then payload.attributes.event_type fallback. */
     private String resolveEventType(PickListEvent event) {
         if (event.getHeaders() != null && event.getHeaders().getEventType() != null) {
             return event.getHeaders().getEventType();
@@ -187,41 +188,4 @@ public class PickListEventListener {
         return "update";
     }
 
-    /**
-     * Extracts transactionId from serviceRequests[0].transactions[0].
-     * Falls back to pickId if absent.
-     */
-    private String extractTransactionId(PickListEvent.Payload payload, String fallback) {
-        PickListEvent.Transaction tx = getFirstTransaction(payload);
-        if (tx != null && tx.getTransactionId() != null && !tx.getTransactionId().isEmpty()) {
-            return tx.getTransactionId();
-        }
-        return fallback;
-    }
-
-    /**
-     * Extracts qty_picked from serviceRequests[0].transactions[0].containerAttributes.
-     */
-    private int extractQtyPicked(PickListEvent.Payload payload) {
-        PickListEvent.Transaction tx = getFirstTransaction(payload);
-        if (tx != null && tx.getContainerAttributes() != null) {
-            return tx.getContainerAttributes().getQtyPicked();
-        }
-        return 0;
-    }
-
-    /**
-     * Returns serviceRequests[0].transactions[0], or null if not present.
-     */
-    private PickListEvent.Transaction getFirstTransaction(PickListEvent.Payload payload) {
-        List<PickListEvent.ServiceRequest> serviceRequests = payload.getServiceRequests();
-        if (serviceRequests == null || serviceRequests.isEmpty()) {
-            return null;
-        }
-        List<PickListEvent.Transaction> transactions = serviceRequests.get(0).getTransactions();
-        if (transactions == null || transactions.isEmpty()) {
-            return null;
-        }
-        return transactions.get(0);
-    }
 }

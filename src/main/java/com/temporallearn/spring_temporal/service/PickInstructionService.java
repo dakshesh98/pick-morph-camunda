@@ -176,22 +176,24 @@ public class PickInstructionService {
         }
     }
 
-    // ─── Step 4: Build and publish item picked events ───────────────────────
+    // ─── Step 4: Publish item picked event ──────────────────────────────────
 
     /**
-     * Builds and publishes one {@link ItemPickedEvent} per (serviceRequest × transaction) pair
-     * in the given pick_transaction event.
+     * Finds the specific transaction by ID across all serviceRequests in the event,
+     * builds and publishes exactly one {@link ItemPickedEvent} for it.
+     *
+     * Must only be called AFTER validateAndPersist() succeeds for this transactionId
+     * (transaction_status commit gate — DB before Kafka).
      *
      * Field sources:
      *   - PPS fields (pps_id, seat_name, etc.)  — pickInstruction (Camunda process var)
      *   - item_uid, tpid                         — ae_order.payload (stored PickListRequest)
-     *   - transaction_id, state, picked_qty      — PickListEvent.Transaction
-     *
-     * Must only be called AFTER validateAndPersist() succeeds (transaction_status commit gate).
+     *   - transaction_id, state, picked_qty      — PickListEvent.Transaction (matched by transactionId)
      */
-    public void buildAndPublishItemPickedEvents(String pickId,
-                                                PickInstruction pi,
-                                                PickListEvent event) {
+    public void publishItemPickedEvent(String pickId,
+                                       PickInstruction pi,
+                                       PickListEvent event,
+                                       String transactionId) {
         AeOrder aeOrder = aeOrderRepository.findById(pickId)
                 .orElseThrow(() -> new IllegalStateException(
                         "ae_order not found for pickId: " + pickId + " — cannot build ItemPickedEvent"));
@@ -203,7 +205,6 @@ public class PickInstructionService {
             throw new RuntimeException("Failed to deserialize ae_order payload for pickId: " + pickId, e);
         }
 
-        // Common fields from PickListRequest payload
         String tpid = null;
         try {
             tpid = storedRequest.getAttributes().getOrderOptions()
@@ -214,40 +215,36 @@ public class PickInstructionService {
 
         List<PickListEvent.ServiceRequest> serviceRequests =
                 event.getValue().getPayload().getServiceRequests();
+        List<PickListRequest.ServiceRequest> storedSRs = storedRequest.getServiceRequests();
 
-        if (serviceRequests == null || serviceRequests.isEmpty()) {
+        if (serviceRequests == null) {
             log.warn("No serviceRequests in pick_transaction event for pickId: {} — skipping publish", pickId);
             return;
         }
 
-        List<PickListRequest.ServiceRequest> storedSRs = storedRequest.getServiceRequests();
-
         for (int i = 0; i < serviceRequests.size(); i++) {
-            PickListEvent.ServiceRequest evtSR = serviceRequests.get(i);
-
-            // Resolve item_uid from the matching stored serviceRequest (by index)
-            String itemUid = null;
-            if (storedSRs != null && storedSRs.size() > i) {
-                try {
-                    itemUid = storedSRs.get(i)
-                            .getExpectations()
-                            .getContainers().get(0)
-                            .getProducts().get(0)
-                            .getProductAttributes()
-                            .getProductSku();
-                } catch (Exception e) {
-                    log.warn("Could not extract itemUid from ae_order serviceRequests[{}] for pickId: {}",
-                            i, pickId);
-                }
-            }
-
-            List<PickListEvent.Transaction> transactions = evtSR.getTransactions();
-            if (transactions == null || transactions.isEmpty()) {
-                log.debug("No transactions in serviceRequests[{}] for pickId: {} — skipping", i, pickId);
-                continue;
-            }
+            List<PickListEvent.Transaction> transactions = serviceRequests.get(i).getTransactions();
+            if (transactions == null) continue;
 
             for (PickListEvent.Transaction tx : transactions) {
+                if (!transactionId.equals(tx.getTransactionId())) continue;
+
+                // Found — resolve item_uid from matching stored serviceRequest (by index)
+                String itemUid = null;
+                if (storedSRs != null && storedSRs.size() > i) {
+                    try {
+                        itemUid = storedSRs.get(i)
+                                .getExpectations()
+                                .getContainers().get(0)
+                                .getProducts().get(0)
+                                .getProductAttributes()
+                                .getProductSku();
+                    } catch (Exception e) {
+                        log.warn("Could not extract itemUid from ae_order serviceRequests[{}] for pickId: {}",
+                                i, pickId);
+                    }
+                }
+
                 int pickedQty = (tx.getContainerAttributes() != null)
                         ? tx.getContainerAttributes().getQtyPicked() : 0;
 
@@ -275,9 +272,13 @@ public class PickInstructionService {
 
                 kafkaTemplate.send(itemPickedEventsTopic, pickId, evt);
                 log.info("Published ItemPickedEvent to '{}' for pickId: {}, txId: {}",
-                        itemPickedEventsTopic, pickId, tx.getTransactionId());
+                        itemPickedEventsTopic, pickId, transactionId);
+                return;
             }
         }
+
+        log.warn("Transaction {} not found in event for pickId: {} — no ItemPickedEvent published",
+                transactionId, pickId);
     }
 
     // ─── Mark complete / failed ─────────────────────────────────────────────
