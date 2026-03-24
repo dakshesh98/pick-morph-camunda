@@ -149,7 +149,17 @@ public class PickInstructionService {
             mergeIfNotNull(payloadMap, "expectations", evtPayload.getExpectations());
             if (evtPayload.getAttributes() != null) {
                 mergeIfNotNull(payloadMap, "sub_state", evtPayload.getAttributes().getSubState());
-                payloadMap.put("attributes", evtPayload.getAttributes());
+                // Merge individual fields into existing stored attributes — never replace entirely
+                // so original order_options / customer_order_info are preserved for tpid extraction.
+                @SuppressWarnings("unchecked")
+                Map<String, Object> storedTopAttrs = (Map<String, Object>)
+                        payloadMap.computeIfAbsent("attributes", k -> new LinkedHashMap<>());
+                PickListEvent.PayloadAttributes ea = evtPayload.getAttributes();
+                mergeIfNotNull(storedTopAttrs, "event_type",    ea.getEventType());
+                mergeIfNotNull(storedTopAttrs, "sub_state",     ea.getSubState());
+                mergeIfNotNull(storedTopAttrs, "cust_identity", ea.getCustIdentity());
+                mergeIfNotNull(storedTopAttrs, "destination",   ea.getDestination());
+                mergeIfNotNull(storedTopAttrs, "flow_name",     ea.getFlowName());
             }
 
             // ── Level 2: per-serviceRequest selective update ──────────────────
@@ -169,10 +179,17 @@ public class PickInstructionService {
                                 mergeIfNotNull(storedSR, "status",       evtSR.getStatus());
                                 mergeIfNotNull(storedSR, "actuals",      evtSR.getActuals());
                                 mergeIfNotNull(storedSR, "expectations", evtSR.getExpectations());
-                                if (evtSR.getAttributes() != null) {
+                                                if (evtSR.getAttributes() != null) {
                                     mergeIfNotNull(storedSR, "sub_state",
                                             evtSR.getAttributes().getSubState());
-                                    storedSR.put("attributes", evtSR.getAttributes());
+                                    // Merge into existing SR attributes — preserves extra_info, location etc.
+                                    @SuppressWarnings("unchecked")
+                                    Map<String, Object> storedSRAttrs = (Map<String, Object>)
+                                            storedSR.computeIfAbsent("attributes", k -> new LinkedHashMap<>());
+                                    PickListEvent.ServiceRequestAttributes sa = evtSR.getAttributes();
+                                    mergeIfNotNull(storedSRAttrs, "sub_state",       sa.getSubState());
+                                    mergeIfNotNull(storedSRAttrs, "orderType",       sa.getOrderType());
+                                    mergeIfNotNull(storedSRAttrs, "simple_priority", sa.getSimplePriority());
                                 }
                             });
                 }
@@ -258,8 +275,17 @@ public class PickInstructionService {
     private void validatePersistAndEnqueue(String pickInstructionId, String txId, PickInstruction pi, PickListEvent event) {
         log.info("validatePersistAndEnqueue — pickInstructionId: {}, txId: {}", pickInstructionId, txId);
 
-        // Persist transaction_status (PK constraint guards against races)
-        persistTransactionStatus(txId, pickInstructionId, "SUCCESS");
+        // Find the matching transaction from the event to capture its payload
+        PickListEvent.Transaction matchedTx = event.getValue().getPayload().getServiceRequests()
+                .stream()
+                .filter(sr -> sr.getTransactions() != null)
+                .flatMap(sr -> sr.getTransactions().stream())
+                .filter(tx -> txId.equals(tx.getTransactionId()))
+                .findFirst()
+                .orElse(null);
+
+        // Persist transaction_status with the raw transaction payload (PK constraint guards against races)
+        persistTransactionStatus(txId, pickInstructionId, "SUCCESS", matchedTx);
 
         // Build ItemPickedEvent JSON — reads ae_order updated above in the same transaction
         String eventJson = buildItemPickedEventJson(pickInstructionId, pi, event, txId);
@@ -393,12 +419,16 @@ public class PickInstructionService {
             throw new RuntimeException("Failed to deserialize ae_order payload for pickInstructionId: " + pickInstructionId, e);
         }
 
-        String tpid = null;
+        // Primary source: PickInstruction (always present); fallback: ae_order attributes.order_options
+        String tpid = pi.getTpid();
         try {
-            tpid = storedRequest.getAttributes().getOrderOptions()
+            String storedTpid = storedRequest.getAttributes().getOrderOptions()
                     .getCustomerOrderInfo().getShipmentId();
+            if (storedTpid != null && !storedTpid.isEmpty()) {
+                tpid = storedTpid;
+            }
         } catch (NullPointerException e) {
-            log.warn("Could not extract tpid from ae_order payload for pickInstructionId: {}", pickInstructionId);
+            log.debug("tpid not in ae_order order_options — using PickInstruction.tpid: {}", tpid);
         }
 
         List<PickListEvent.ServiceRequest> serviceRequests =
@@ -476,12 +506,21 @@ public class PickInstructionService {
         return null;
     }
 
-    private void persistTransactionStatus(String txId, String pickInstructionId, String status) {
+    private void persistTransactionStatus(String txId, String pickInstructionId, String status,
+                                           PickListEvent.Transaction tx) {
         if (txId == null || txId.isEmpty()) {
             return;
         }
         try {
-            TransactionStatus ts = new TransactionStatus(txId, pickInstructionId, status, Instant.now());
+            String txPayload = null;
+            if (tx != null) {
+                try {
+                    txPayload = objectMapper.writeValueAsString(tx);
+                } catch (Exception e) {
+                    log.warn("Could not serialize transaction payload for txId: {}", txId, e);
+                }
+            }
+            TransactionStatus ts = new TransactionStatus(txId, pickInstructionId, status, Instant.now(), txPayload);
             transactionStatusRepository.save(ts);
         } catch (Exception e) {
             log.warn("Failed to persist transaction status {} for txId: {}", status, txId, e);

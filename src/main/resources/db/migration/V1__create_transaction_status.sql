@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS transaction_status (
     transaction_id VARCHAR(255) NOT NULL PRIMARY KEY,
     pick_instruction_id VARCHAR(255),
     status VARCHAR(50) NOT NULL,
+    payload JSONB,
     last_updated TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 

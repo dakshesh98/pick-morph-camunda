@@ -4,6 +4,9 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
+
 import java.time.Instant;
 
 @Entity
@@ -23,6 +26,11 @@ public class TransactionStatus {
     @Column(name = "last_updated")
     private Instant lastUpdated;
 
+    /** Raw transaction data from the pick_transaction event (containerAttributes, products, etc.). */
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "payload", columnDefinition = "jsonb")
+    private String payload;
+
     public TransactionStatus() {}
 
     public TransactionStatus(String transactionId, String pickInstructionId, String status, Instant lastUpdated) {
@@ -32,35 +40,26 @@ public class TransactionStatus {
         this.lastUpdated = lastUpdated;
     }
 
-    public String getTransactionId() {
-        return transactionId;
-    }
-
-    public void setTransactionId(String transactionId) {
+    public TransactionStatus(String transactionId, String pickInstructionId, String status, Instant lastUpdated, String payload) {
         this.transactionId = transactionId;
-    }
-
-    public String getPickInstructionId() {
-        return pickInstructionId;
-    }
-
-    public void setPickInstructionId(String pickInstructionId) {
         this.pickInstructionId = pickInstructionId;
-    }
-
-    public String getStatus() {
-        return status;
-    }
-
-    public void setStatus(String status) {
         this.status = status;
-    }
-
-    public Instant getLastUpdated() {
-        return lastUpdated;
-    }
-
-    public void setLastUpdated(Instant lastUpdated) {
         this.lastUpdated = lastUpdated;
+        this.payload = payload;
     }
+
+    public String getTransactionId() { return transactionId; }
+    public void setTransactionId(String transactionId) { this.transactionId = transactionId; }
+
+    public String getPickInstructionId() { return pickInstructionId; }
+    public void setPickInstructionId(String pickInstructionId) { this.pickInstructionId = pickInstructionId; }
+
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+
+    public Instant getLastUpdated() { return lastUpdated; }
+    public void setLastUpdated(Instant lastUpdated) { this.lastUpdated = lastUpdated; }
+
+    public String getPayload() { return payload; }
+    public void setPayload(String payload) { this.payload = payload; }
 }

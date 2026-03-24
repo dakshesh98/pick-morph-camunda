@@ -209,16 +209,18 @@ public class PickListEvent {
         @JsonProperty("transactionId")
         private String transactionId;
 
-        /** PROCESSED, CREATED */
-        @JsonProperty("transactionStatus")
-        private String transactionStatus;
-
-        /** complete, in_progress, etc. */
-        @JsonProperty("transactionState")
+        /**
+         * State of the transaction (e.g. "complete", "in_progress").
+         * Confluent/AE sends this as "state" (not "transactionState").
+         */
+        @JsonProperty("state")
         private String transactionState;
 
-        /** PICK, DROP, SCAN */
-        @JsonProperty("transactionType")
+        /**
+         * Type of the transaction container (e.g. "VIRTUAL", "PHYSICAL").
+         * Confluent/AE sends this as "type" (not "transactionType").
+         */
+        @JsonProperty("type")
         private String transactionType;
 
         @JsonProperty("containerAttributes")

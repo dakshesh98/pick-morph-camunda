@@ -71,7 +71,7 @@ public class PickListRequestMapper {
 
     private PickListRequest.ServiceRequest buildServiceRequest(PickInstruction pi) {
         return PickListRequest.ServiceRequest.builder()
-                .externalServiceRequestId(pi.getPickInstructionId())
+                .externalServiceRequestId(pi.getPickInstructionId() + "_1")
                 .type("PICK_LINE")
                 .attributes(buildServiceRequestAttributes(pi))
                 .expectations(buildExpectations(pi))

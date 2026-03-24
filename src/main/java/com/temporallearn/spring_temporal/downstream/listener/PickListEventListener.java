@@ -117,7 +117,7 @@ public class PickListEventListener {
                     .processInstanceVariableEquals("pickInstructionId", pickInstructionId)
                     .setVariable("command", "UPDATE")
                     .setVariable("aeEventType", "pick_transaction")
-                    .setVariable("pickListEventJson", rawEventJson)
+                    .setVariable("pickListEventJson", rawEventJson.getBytes(java.nio.charset.StandardCharsets.UTF_8))
                     .correlate();
             log.info("ItemPickingEventMessage correlated for pick_transaction | pickInstructionId: {}", pickInstructionId);
         } catch (MismatchingMessageCorrelationException e) {

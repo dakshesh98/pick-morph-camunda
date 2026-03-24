@@ -1,5 +1,24 @@
 # pick-morph-camunda — Claude Instructions
 
+## Compile the Project (Locally)
+Compile the project after every code change made locally
+```bash
+./mvnw compile -q
+```
+
+## Start the app (Docker)
+
+Clean state + rebuild + run (hot path if containers already up, cold start otherwise):
+```bash
+./setup.sh
+```
+
+This script:
+- If `spring-camunda` is **already running**: truncates Postgres tables, deletes Kafka topics, rebuilds and restarts only `spring-camunda`
+- If **not running**: starts all services (postgres, kafka, kafka-ui, spring-camunda, nginx) from scratch
+
+App is available at `http://localhost:9191` once healthy.
+
 ## BPMN Viewer
 
 The BPMN viewer lives at `.claude/bpmn-viewer/index.html` and is served via `python3 -m http.server 5500` (configured in `../.claude/launch.json`).

@@ -51,7 +51,10 @@ public class SendItemPickedEventDelegate implements JavaDelegate {
 
         if ("pick_transaction".equalsIgnoreCase(aeEventType)) {
             String instructionJson  = (String) execution.getVariable("instructionJson");
-            String pickListEventJson = (String) execution.getVariable("pickListEventJson");
+            Object rawPickListEventVar = execution.getVariable("pickListEventJson");
+            String pickListEventJson = rawPickListEventVar instanceof byte[]
+                    ? new String((byte[]) rawPickListEventVar, java.nio.charset.StandardCharsets.UTF_8)
+                    : (String) rawPickListEventVar;
 
             PickInstruction pickInstruction = objectMapper.readValue(instructionJson, PickInstruction.class);
             PickListEvent   pickListEvent   = objectMapper.readValue(pickListEventJson, PickListEvent.class);
@@ -65,6 +68,8 @@ public class SendItemPickedEventDelegate implements JavaDelegate {
             }
         }
 
+        // txStatus drives txFailedGateway: SUCCESS = normal path, FAILED = terminal failure path
+        execution.setVariable("txStatus", "SUCCESS");
         // txComplete always false — completion is driven by command=COMPLETE via commandGateway
         execution.setVariable("txComplete", false);
     }
