@@ -45,15 +45,15 @@ public class PickInstructionListener {
             return;
         }
 
-        log.info("Received pick instruction via Kafka for pickId: {}", instruction.getPickId());
+        log.info("Received pick instruction via Kafka for pickInstructionId: {}", instruction.getPickInstructionId());
 
         try {
             pickInstructionProcessService.startProcess(instruction);
         } catch (Exception e) {
-            log.error("Failed to start Camunda process for pickId: {} via Kafka trigger: {}",
-                    instruction.getPickId(), e.getMessage(), e);
+            log.error("Failed to start Camunda process for pickInstructionId: {} via Kafka trigger: {}",
+                    instruction.getPickInstructionId(), e.getMessage(), e);
             // Re-throw to trigger Kafka consumer retry / dead-letter handling
-            throw new RuntimeException("Failed to start process for pickId: " + instruction.getPickId(), e);
+            throw new RuntimeException("Failed to start process for pickInstructionId: " + instruction.getPickInstructionId(), e);
         }
     }
 }

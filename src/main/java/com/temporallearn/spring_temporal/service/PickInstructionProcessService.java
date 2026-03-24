@@ -34,45 +34,45 @@ public class PickInstructionProcessService {
      * the start is skipped and a warning is logged.
      */
     public void startProcess(PickInstruction instruction) {
-        String businessKey = "Order_workflow_" + instruction.getPickId();
+        String businessKey = "Order_workflow_" + instruction.getPickInstructionId();
 
         // Idempotency check
         long existing = runtimeService.createProcessInstanceQuery()
                 .processInstanceBusinessKey(businessKey)
                 .count();
         if (existing > 0) {
-            log.warn("Process already running for pickId: {}", instruction.getPickId());
+            log.warn("Process already running for pickInstructionId: {}", instruction.getPickInstructionId());
             return;
         }
 
         try {
             String instructionJson = objectMapper.writeValueAsString(instruction);
             Map<String, Object> vars = new HashMap<>();
-            vars.put("pickId", instruction.getPickId());
+            vars.put("pickInstructionId", instruction.getPickInstructionId());
             vars.put("instructionJson", instructionJson);
             vars.put("finalStatus", "UNKNOWN");
 
             runtimeService.startProcessInstanceByKey("pickInstructionProcess", businessKey, vars);
-            log.info("Started Camunda process for pickId: {}", instruction.getPickId());
+            log.info("Started Camunda process for pickInstructionId: {}", instruction.getPickInstructionId());
         } catch (Exception e) {
-            log.error("Failed to start Camunda process for pickId: {}", instruction.getPickId(), e);
-            throw new RuntimeException("Failed to start process for pickId: " + instruction.getPickId(), e);
+            log.error("Failed to start Camunda process for pickInstructionId: {}", instruction.getPickInstructionId(), e);
+            throw new RuntimeException("Failed to start process for pickInstructionId: " + instruction.getPickInstructionId(), e);
         }
     }
 
     /**
-     * Terminate the running process instance for the given pickId, if one exists.
+     * Terminate the running process instance for the given pickInstructionId, if one exists.
      */
-    public void terminateProcess(String pickId) {
-        String businessKey = "Order_workflow_" + pickId;
+    public void terminateProcess(String pickInstructionId) {
+        String businessKey = "Order_workflow_" + pickInstructionId;
         ProcessInstance pi = runtimeService.createProcessInstanceQuery()
                 .processInstanceBusinessKey(businessKey)
                 .singleResult();
         if (pi != null) {
             runtimeService.deleteProcessInstance(pi.getId(), "Manually terminated");
-            log.info("Terminated Camunda process for pickId: {}", pickId);
+            log.info("Terminated Camunda process for pickInstructionId: {}", pickInstructionId);
         } else {
-            log.warn("No running process found to terminate for pickId: {}", pickId);
+            log.warn("No running process found to terminate for pickInstructionId: {}", pickInstructionId);
         }
     }
 }

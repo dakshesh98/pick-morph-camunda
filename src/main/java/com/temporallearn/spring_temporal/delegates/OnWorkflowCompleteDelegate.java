@@ -8,7 +8,7 @@ import org.springframework.stereotype.Component;
 
 /**
  * Terminal cleanup delegate — always invoked at the end of every process path.
- * Reads "pickId", "finalStatus", and "finalFailureReason" from process variables,
+ * Reads "pickInstructionId", "finalStatus", and "finalFailureReason" from process variables,
  * then delegates to PickInstructionService.onWorkflowComplete() for status
  * validation against Butler Core and audit event publication to Kafka.
  */
@@ -24,13 +24,13 @@ public class OnWorkflowCompleteDelegate implements JavaDelegate {
 
     @Override
     public void execute(DelegateExecution execution) throws Exception {
-        String pickId = (String) execution.getVariable("pickId");
+        String pickInstructionId = (String) execution.getVariable("pickInstructionId");
         String finalStatus = (String) execution.getVariable("finalStatus");
         String failureReason = (String) execution.getVariable("finalFailureReason");
 
-        log.info("OnWorkflowCompleteDelegate executing for pickId: {}, finalStatus: {}",
-                pickId, finalStatus);
+        log.info("OnWorkflowCompleteDelegate executing for pickInstructionId: {}, finalStatus: {}",
+                pickInstructionId, finalStatus);
 
-        pickInstructionService.onWorkflowComplete(pickId, finalStatus, failureReason);
+        pickInstructionService.onWorkflowComplete(pickInstructionId, finalStatus, failureReason);
     }
 }

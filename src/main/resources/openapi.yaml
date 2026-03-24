@@ -44,13 +44,13 @@ paths:
             text/plain:
               schema:
                 type: string
-  /Order/terminate/{pickId}:
+  /Order/terminate/{pickInstructionId}:
     delete:
       summary: Terminate workflow
       operationId: terminateWorkflow
       tags: [Order]
       parameters:
-        - name: pickId
+        - name: pickInstructionId
           in: path
           required: true
           schema:
@@ -86,7 +86,7 @@ components:
     PickInstruction:
       type: object
       properties:
-        pickId:
+        pickInstructionId:
           type: string
           description: Used as WorkflowId and OrderId
         item:
@@ -106,7 +106,7 @@ components:
         qty:
           type: integer
           format: int32
-      required: [pickId, item, tpid, uom, qty]
+      required: [pickInstructionId, item, tpid, uom, qty]
     Order:
       type: object
       properties:
@@ -155,7 +155,7 @@ components:
     TransactionUpdate:
       type: object
       properties:
-        pickId:
+        pickInstructionId:
           type: string
         transactionId:
           type: string
@@ -176,16 +176,16 @@ components:
           description: ISO-8601 timestamp
         additionalInfo:
           type: string
-      required: [pickId, transactionId, command, status]
+      required: [pickInstructionId, transactionId, command, status]
   # Kafka message descriptions
   x-kafka:
     topics:
       my-topic:
         direction: inbound
-        description: Triggers creation of a new PickInstruction workflow based on pickId in the message body.
+        description: Triggers creation of a new PickInstruction workflow based on pickInstructionId in the message body.
         payload:
           type: string
-          description: Raw pickId string used to populate PickInstruction
+          description: Raw pickInstructionId string used to populate PickInstruction
       transaction-updates-topic:
         direction: inbound
         description: Transaction updates consumed by TransactionUpdateListener.

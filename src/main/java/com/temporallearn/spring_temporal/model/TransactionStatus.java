@@ -14,8 +14,8 @@ public class TransactionStatus {
     @Column(name = "transaction_id", nullable = false)
     private String transactionId;
 
-    @Column(name = "pick_id")
-    private String pickId;
+    @Column(name = "pick_instruction_id")
+    private String pickInstructionId;
 
     @Column(name = "status")
     private String status; // IN_PROGRESS, SUCCESS, FAILED
@@ -25,9 +25,9 @@ public class TransactionStatus {
 
     public TransactionStatus() {}
 
-    public TransactionStatus(String transactionId, String pickId, String status, Instant lastUpdated) {
+    public TransactionStatus(String transactionId, String pickInstructionId, String status, Instant lastUpdated) {
         this.transactionId = transactionId;
-        this.pickId = pickId;
+        this.pickInstructionId = pickInstructionId;
         this.status = status;
         this.lastUpdated = lastUpdated;
     }
@@ -40,12 +40,12 @@ public class TransactionStatus {
         this.transactionId = transactionId;
     }
 
-    public String getPickId() {
-        return pickId;
+    public String getPickInstructionId() {
+        return pickInstructionId;
     }
 
-    public void setPickId(String pickId) {
-        this.pickId = pickId;
+    public void setPickInstructionId(String pickInstructionId) {
+        this.pickInstructionId = pickInstructionId;
     }
 
     public String getStatus() {

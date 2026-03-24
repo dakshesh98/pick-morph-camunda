@@ -5,7 +5,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 /**
  * Spring Data JPA repository for the ae_order table.
- * Key: external_service_request_id (= pickId).
+ * Key: external_service_request_id (= pickInstructionId).
  */
 public interface AeOrderRepository extends JpaRepository<AeOrder, String> {
 }

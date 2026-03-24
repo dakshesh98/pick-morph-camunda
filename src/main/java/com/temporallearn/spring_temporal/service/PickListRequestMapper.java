@@ -12,7 +12,7 @@ import java.util.List;
  * (AE contract wire format) for publishing to <tenant>.pick-list.requests.
  *
  * Field mapping rationale:
- *   pickId          → externalServiceRequestId (single order per instruction)
+ *   pickInstructionId          → externalServiceRequestId (single order per instruction)
  *   dropLocation    → fulfillmentArea + destinationGroup (drop zone is the fulfilment destination)
  *   tpid            → shipmentId (transport plan ID maps to AE shipment concept)
  *   pickLocation    → location fields (raw address; AE parses sub-fields on their side)
@@ -26,7 +26,7 @@ public class PickListRequestMapper {
 
     public PickListRequest toPickListRequest(PickInstruction pi) {
         return PickListRequest.builder()
-                .externalServiceRequestId(pi.getPickId())
+                .externalServiceRequestId(pi.getPickInstructionId())
                 .type("PICK")
                 .fulfillmentArea(List.of(pi.getDropLocation()))
                 .attributes(buildTopLevelAttributes(pi))
@@ -47,9 +47,9 @@ public class PickListRequestMapper {
     private PickListRequest.OrderOptions buildOrderOptions(PickInstruction pi) {
         return PickListRequest.OrderOptions.builder()
                 .customerOrderInfo(PickListRequest.CustomerOrderInfo.builder()
-                        .orderId(pi.getPickId())
-                        .orderLineId(pi.getPickId())
-                        .masterOrderId(pi.getPickId())
+                        .orderId(pi.getPickInstructionId())
+                        .orderLineId(pi.getPickInstructionId())
+                        .masterOrderId(pi.getPickInstructionId())
                         .shipmentId(pi.getTpid())
                         .build())
                 .palletization(false)
@@ -57,7 +57,7 @@ public class PickListRequestMapper {
                 .orderSplitting(false)
                 .orderlineSplitting(false)
                 .groupingTags(PickListRequest.GroupingTags.builder()
-                        .missionGrouningTag(pi.getPickId())
+                        .missionGrouningTag(pi.getPickInstructionId())
                         .containerGroupingTag(pi.getBinId())
                         .binGroupingTag(pi.getBinId())
                         .build())
@@ -71,7 +71,7 @@ public class PickListRequestMapper {
 
     private PickListRequest.ServiceRequest buildServiceRequest(PickInstruction pi) {
         return PickListRequest.ServiceRequest.builder()
-                .externalServiceRequestId(pi.getPickId())
+                .externalServiceRequestId(pi.getPickInstructionId())
                 .type("PICK_LINE")
                 .attributes(buildServiceRequestAttributes(pi))
                 .expectations(buildExpectations(pi))
@@ -81,7 +81,7 @@ public class PickListRequestMapper {
     private PickListRequest.ServiceRequestAttributes buildServiceRequestAttributes(PickInstruction pi) {
         return PickListRequest.ServiceRequestAttributes.builder()
                 .extraInfo(PickListRequest.ExtraInfo.builder()
-                        .clientTaskId(pi.getPickId())
+                        .clientTaskId(pi.getPickInstructionId())
                         .build())
                 .shelfLifeHours(0)
                 .location(PickListRequest.Location.builder()

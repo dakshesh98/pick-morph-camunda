@@ -6,7 +6,7 @@ import lombok.Data;
 
 @Data
 public class PickInstruction {
-    private String pickId;               // Used as WorkflowId and OrderId
+    private String pickInstructionId;               // Used as WorkflowId and OrderId
     private String item;
     private String tpid;
     private List<String> scannableBarcodes;

@@ -29,27 +29,27 @@ public class PickWorkflowController {
      * The process will publish a PickListRequest to <tenant>.pick-list.requests
      * and wait for AE to respond on <tenant>.pick-list.response.
      *
-     * Idempotent: duplicate starts for the same pickId are silently ignored.
+     * Idempotent: duplicate starts for the same pickInstructionId are silently ignored.
      *
      * Example: POST /Order/pick_instruction
-     * Body: {"pickId": "Pick5", "item": "SKU-001", ...}
+     * Body: {"pickInstructionId": "Pick5", "item": "SKU-001", ...}
      */
     @PostMapping("/pick_instruction")
     public ResponseEntity<String> startPickInstruction(@RequestBody PickInstruction pickInstruction) {
         processService.startProcess(pickInstruction);
-        log.info("Pick instruction process started for pickId: {}", pickInstruction.getPickId());
-        return ResponseEntity.ok("Pick instruction process started for pickId: "
-                + pickInstruction.getPickId());
+        log.info("Pick instruction process started for pickInstructionId: {}", pickInstruction.getPickInstructionId());
+        return ResponseEntity.ok("Pick instruction process started for pickInstructionId: "
+                + pickInstruction.getPickInstructionId());
     }
 
     /**
      * Terminate a stuck/running process instance.
      * Example: DELETE /Order/terminate/Pick5
      */
-    @DeleteMapping("/terminate/{pickId}")
-    public ResponseEntity<String> terminateWorkflow(@PathVariable String pickId) {
-        processService.terminateProcess(pickId);
-        log.info("Process terminate requested for pickId: {}", pickId);
-        return ResponseEntity.ok("Process terminated for pickId: " + pickId);
+    @DeleteMapping("/terminate/{pickInstructionId}")
+    public ResponseEntity<String> terminateWorkflow(@PathVariable String pickInstructionId) {
+        processService.terminateProcess(pickInstructionId);
+        log.info("Process terminate requested for pickInstructionId: {}", pickInstructionId);
+        return ResponseEntity.ok("Process terminated for pickInstructionId: " + pickInstructionId);
     }
 }

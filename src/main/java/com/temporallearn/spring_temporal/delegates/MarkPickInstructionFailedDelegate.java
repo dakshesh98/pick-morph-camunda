@@ -26,15 +26,15 @@ public class MarkPickInstructionFailedDelegate implements JavaDelegate {
 
     @Override
     public void execute(DelegateExecution execution) throws Exception {
-        String pickId = (String) execution.getVariable("pickId");
+        String pickInstructionId = (String) execution.getVariable("pickInstructionId");
         String transactionId = (String) execution.getVariable("transactionId");
         String failureReason = (String) execution.getVariable("failureReason");
         String command = (String) execution.getVariable("command");
 
-        log.info("MarkPickInstructionFailedDelegate executing for pickId: {}, command: {}, transactionId: {}",
-                pickId, command, transactionId);
+        log.info("MarkPickInstructionFailedDelegate executing for pickInstructionId: {}, command: {}, transactionId: {}",
+                pickInstructionId, command, transactionId);
 
-        pickInstructionService.markPickInstructionFailed(pickId, transactionId, failureReason);
+        pickInstructionService.markPickInstructionFailed(pickInstructionId, transactionId, failureReason);
 
         String finalStatus = "CANCEL".equalsIgnoreCase(command) ? "CANCELLED" : "FAILED";
         execution.setVariable("finalStatus", finalStatus);

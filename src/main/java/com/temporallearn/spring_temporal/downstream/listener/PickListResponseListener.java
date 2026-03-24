@@ -52,7 +52,7 @@ public class PickListResponseListener {
                 success);
 
         if (!success) {
-            log.warn("AE returned FAILURE for pickId: {} | errorCode: {} | message: {}",
+            log.warn("AE returned FAILURE for pickInstructionId: {} | errorCode: {} | message: {}",
                     response.getExternalServiceRequestId(),
                     response.getErrorCode(),
                     response.getMessage());
@@ -60,19 +60,19 @@ public class PickListResponseListener {
 
         try {
             runtimeService.createMessageCorrelation("PickListResponseMessage")
-                    .processInstanceVariableEquals("pickId", response.getExternalServiceRequestId())
+                    .processInstanceVariableEquals("pickInstructionId", response.getExternalServiceRequestId())
                     .setVariable("validationSuccess", success)
                     .setVariable("validationResult", response.getExternalServiceRequestId())
                     .correlate();
 
-            log.info("PickListResponseMessage correlated successfully for pickId: {} | success: {}",
+            log.info("PickListResponseMessage correlated successfully for pickInstructionId: {} | success: {}",
                     response.getExternalServiceRequestId(), success);
 
         } catch (MismatchingMessageCorrelationException e) {
-            log.error("No process instance found waiting for PickListResponseMessage for pickId: {}. " +
+            log.error("No process instance found waiting for PickListResponseMessage for pickInstructionId: {}. " +
                     "Pick-list response dropped.", response.getExternalServiceRequestId());
         } catch (Exception e) {
-            log.error("Failed to correlate ValidationResultMessage for pickId: {} | error: {}",
+            log.error("Failed to correlate ValidationResultMessage for pickInstructionId: {} | error: {}",
                     response.getExternalServiceRequestId(), e.getMessage(), e);
         }
     }

@@ -22,9 +22,9 @@ public class MarkPickInstructionCompleteDelegate implements JavaDelegate {
 
     @Override
     public void execute(DelegateExecution execution) throws Exception {
-        String pickId = (String) execution.getVariable("pickId");
-        log.info("MarkPickInstructionCompleteDelegate executing for pickId: {}", pickId);
-        pickInstructionService.markPickInstructionComplete(pickId);
+        String pickInstructionId = (String) execution.getVariable("pickInstructionId");
+        log.info("MarkPickInstructionCompleteDelegate executing for pickInstructionId: {}", pickInstructionId);
+        pickInstructionService.markPickInstructionComplete(pickInstructionId);
         execution.setVariable("finalStatus", "COMPLETED");
         execution.setVariable("finalFailureReason", null);
     }

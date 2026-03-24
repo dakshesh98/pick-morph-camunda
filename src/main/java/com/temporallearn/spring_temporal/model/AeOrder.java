@@ -32,7 +32,7 @@ import java.time.Instant;
 @AllArgsConstructor
 public class AeOrder {
 
-    /** Primary key — equals PickListRequest.externalServiceRequestId (= pickId). */
+    /** Primary key — equals PickListRequest.externalServiceRequestId (= pickInstructionId). */
     @Id
     @Column(name = "external_service_request_id")
     private String externalServiceRequestId;

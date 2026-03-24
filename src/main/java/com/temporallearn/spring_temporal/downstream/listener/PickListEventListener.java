@@ -1,7 +1,6 @@
 package com.temporallearn.spring_temporal.downstream.listener;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.temporallearn.spring_temporal.dto.TransactionUpdate;
 import com.temporallearn.spring_temporal.dto.ae.PickListEvent;
 import com.temporallearn.spring_temporal.service.PickInstructionService;
 import lombok.extern.slf4j.Slf4j;
@@ -11,28 +10,26 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
 
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * Step 3 — Kafka listener for AE item picking event messages.
  *
  * Consumes messages from gor.pick-list.events published by AE as items are picked
- * throughout the pick lifecycle. On every event:
+ * throughout the pick lifecycle.
  *
- *   1. Updates ae_order.payload selectively (state/sub_state/actuals/expectations/attributes
- *      at both the parent Payload level and per-serviceRequest level).
+ * pick_transaction events:
+ *   Correlates the Camunda ItemPickingEventMessage with pickListEventJson.
+ *   ae_order update + transaction_status + outbox writes are all performed atomically
+ *   inside SendItemPickedEventDelegate → PickInstructionService.processPickTransaction().
  *
- *   2. Maps AE state transitions to internal commands and correlates the Camunda
- *      ItemPickingEventMessage signal. For pick_transaction events, the full event JSON
- *      is also passed as a process variable so SendItemPickedEventDelegate can iterate
- *      all service requests.
+ * update events:
+ *   Updates ae_order selectively (state/sub_state/actuals/expectations/attributes),
+ *   then correlates the Camunda signal with the resolved command (UPDATE or COMPLETE).
  *
  * State mapping:
- *   event_type = "pick_transaction"              → command = UPDATE,   status = IN_PROGRESS
- *   event_type = "update", state = "complete"    → command = COMPLETE, status = COMPLETED
- *   event_type = "update", any other state       → command = UPDATE,   status = IN_PROGRESS
+ *   event_type = "pick_transaction"              → command = UPDATE
+ *   event_type = "update", state = "complete"    → command = COMPLETE
+ *   event_type = "update", any other state       → command = UPDATE
  */
 @Service
 @Slf4j
@@ -72,57 +69,30 @@ public class PickListEventListener {
             return;
         }
 
-        String pickId = eventPayload.getExternalServiceRequestId();
+        String pickInstructionId = eventPayload.getExternalServiceRequestId();
         String orderState = eventPayload.getState();
         String subState = eventPayload.getAttributes() != null
                 ? eventPayload.getAttributes().getSubState() : null;
 
-        log.info("Received pick-list event from AE | pickId: {} | event_type: {} | state: {} | sub_state: {}",
-                pickId, eventType, orderState, subState);
+        log.info("Received pick-list event from AE | pickInstructionId: {} | event_type: {} | state: {} | sub_state: {}",
+                pickInstructionId, eventType, orderState, subState);
 
-        // Step 1 — update ae_order selectively (DB write before Camunda correlation)
-        pickInstructionService.updateAeOrderFromEvent(event);
-
-        // Step 2 — correlate Camunda signal
-        // transactionUpdatesJson (JSON array) is only built and passed for pick_transaction events;
-        // other event types only need command + aeEventType to drive the gateway.
         if ("pick_transaction".equalsIgnoreCase(eventType)) {
-            List<TransactionUpdate> updates = buildPickTransactionUpdates(pickId, eventPayload);
-            log.info("pick_transaction event | pickId: {} | transactions: {}", pickId, updates.size());
-            correlatePickTransaction(updates, payload, pickId);
+            // ae_order update is deferred to the delegate so all DB writes are atomic.
+            // Only the raw event JSON is passed as a process variable.
+            log.info("pick_transaction event | pickInstructionId: {}", pickInstructionId);
+            correlatePickTransaction(payload, pickInstructionId);
         } else {
+            // update events: ae_order updated here (no transaction_status involved)
+            pickInstructionService.updateAeOrderFromEvent(event);
             String command = resolveCommand(eventType, orderState, subState);
-            log.info("AE update event | pickId: {} | command: {} | state: {} | sub_state: {}", pickId, command, orderState, subState);
-            correlateUpdateEvent(command, eventType, subState, pickId);
+            log.info("AE update event | pickInstructionId: {} | command: {} | state: {} | sub_state: {}",
+                    pickInstructionId, command, orderState, subState);
+            correlateUpdateEvent(command, eventType, subState, pickInstructionId);
         }
     }
 
     // ── State mapping ────────────────────────────────────────────────────────
-
-    /**
-     * Builds one TransactionUpdate per (serviceRequest × transaction) for pick_transaction events.
-     * Each transaction needs its own idempotency check and ItemPickedEvent publish.
-     */
-    private List<TransactionUpdate> buildPickTransactionUpdates(String pickId, PickListEvent.Payload payload) {
-        List<TransactionUpdate> updates = new ArrayList<>();
-        if (payload.getServiceRequests() == null) return updates;
-        for (PickListEvent.ServiceRequest sr : payload.getServiceRequests()) {
-            if (sr.getTransactions() == null) continue;
-            for (PickListEvent.Transaction tx : sr.getTransactions()) {
-                updates.add(TransactionUpdate.builder()
-                        .pickId(pickId)
-                        .transactionId(tx.getTransactionId())
-                        .command("UPDATE")
-                        .transactionType("PICK")
-                        .processedQty(tx.getContainerAttributes() != null
-                                ? tx.getContainerAttributes().getQtyPicked() : 0)
-                        .status("IN_PROGRESS")
-                        .timestamp(Instant.now().toString())
-                        .build());
-            }
-        }
-        return updates;
-    }
 
     /** Resolves the Camunda command for non-pick_transaction (update) events. */
     private String resolveCommand(String eventType, String orderState, String subState) {
@@ -136,40 +106,41 @@ public class PickListEventListener {
 
     // ── Camunda correlation ──────────────────────────────────────────────────
 
-    /** Correlates a pick_transaction event — includes transactionUpdatesJson (array) and pickListEventJson. */
-    private void correlatePickTransaction(List<TransactionUpdate> updates, String rawEventJson, String pickId) {
+    /**
+     * Correlates a pick_transaction event.
+     * Passes only pickListEventJson — ae_order update and all DB writes happen atomically
+     * inside SendItemPickedEventDelegate via processPickTransaction().
+     */
+    private void correlatePickTransaction(String rawEventJson, String pickInstructionId) {
         try {
-            String transactionUpdatesJson = objectMapper.writeValueAsString(updates);
             runtimeService.createMessageCorrelation("ItemPickingEventMessage")
-                    .processInstanceVariableEquals("pickId", pickId)
+                    .processInstanceVariableEquals("pickInstructionId", pickInstructionId)
                     .setVariable("command", "UPDATE")
                     .setVariable("aeEventType", "pick_transaction")
-                    .setVariable("transactionUpdatesJson", transactionUpdatesJson)
                     .setVariable("pickListEventJson", rawEventJson)
                     .correlate();
-            log.info("ItemPickingEventMessage correlated for pick_transaction | pickId: {} | transactions: {}",
-                    pickId, updates.size());
+            log.info("ItemPickingEventMessage correlated for pick_transaction | pickInstructionId: {}", pickInstructionId);
         } catch (MismatchingMessageCorrelationException e) {
-            log.error("No process instance waiting for pickId: {} — pick_transaction event dropped", pickId);
+            log.error("No process instance waiting for pickInstructionId: {} — pick_transaction event dropped", pickInstructionId);
         } catch (Exception e) {
-            log.error("Failed to correlate pick_transaction for pickId: {} | error: {}", pickId, e.getMessage(), e);
+            log.error("Failed to correlate pick_transaction for pickInstructionId: {} | error: {}", pickInstructionId, e.getMessage(), e);
         }
     }
 
     /** Correlates a non-pick_transaction (update) event — only command + aeEventType, no transactionUpdateJson. */
-    private void correlateUpdateEvent(String command, String eventType, String subState, String pickId) {
+    private void correlateUpdateEvent(String command, String eventType, String subState, String pickInstructionId) {
         try {
             runtimeService.createMessageCorrelation("ItemPickingEventMessage")
-                    .processInstanceVariableEquals("pickId", pickId)
+                    .processInstanceVariableEquals("pickInstructionId", pickInstructionId)
                     .setVariable("command", command)
                     .setVariable("aeEventType", eventType)
                     .setVariable("failureReason", subState)
                     .correlate();
-            log.info("ItemPickingEventMessage correlated for update event | pickId: {} | command: {}", pickId, command);
+            log.info("ItemPickingEventMessage correlated for update event | pickInstructionId: {} | command: {}", pickInstructionId, command);
         } catch (MismatchingMessageCorrelationException e) {
-            log.error("No process instance waiting for pickId: {} — update event dropped", pickId);
+            log.error("No process instance waiting for pickInstructionId: {} — update event dropped", pickInstructionId);
         } catch (Exception e) {
-            log.error("Failed to correlate update event for pickId: {} | error: {}", pickId, e.getMessage(), e);
+            log.error("Failed to correlate update event for pickInstructionId: {} | error: {}", pickInstructionId, e.getMessage(), e);
         }
     }
 

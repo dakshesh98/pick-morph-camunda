@@ -16,7 +16,7 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 public class TransactionUpdate {
 
-    private String pickId;
+    private String pickInstructionId;
     private String transactionId;
     private String command;          // UPDATE, COMPLETE, CANCEL, RETRY
     private String transactionType;  // hardcoded "PICK" — no transactionType in AE contract

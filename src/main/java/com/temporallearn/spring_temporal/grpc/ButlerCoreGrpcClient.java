@@ -83,17 +83,17 @@ public class ButlerCoreGrpcClient {
     /**
      * Get pick instruction status from Butler Core.
      *
-     * @param pickId the pick instruction ID
+     * @param pickInstructionId the pick instruction ID
      * @return GetPickInstructionStatusResponse with current status
      */
-    public GetPickInstructionStatusResponse getPickInstructionStatus(String pickId) {
-        log.info("Getting pick instruction status from Butler Core - pickId: {}", pickId);
+    public GetPickInstructionStatusResponse getPickInstructionStatus(String pickInstructionId) {
+        log.info("Getting pick instruction status from Butler Core - pickInstructionId: {}", pickInstructionId);
 
         // Return mock response if mock mode is enabled
         if (mockEnabled) {
             log.info("MOCK MODE: Returning simulated status for pick instruction");
             return GetPickInstructionStatusResponse.newBuilder()
-                    .setPickId(pickId)
+                    .setPickId(pickInstructionId)
                     .setStatus("IN_PROGRESS")
                     .setIsComplete(false)
                     .setTotalQty(10)
@@ -103,7 +103,7 @@ public class ButlerCoreGrpcClient {
         }
 
         GetPickInstructionStatusRequest request = GetPickInstructionStatusRequest.newBuilder()
-                .setPickId(pickId)
+                .setPickId(pickInstructionId)
                 .build();
 
         try {
@@ -111,7 +111,7 @@ public class ButlerCoreGrpcClient {
                     .withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS)
                     .getPickInstructionStatus(request);
 
-            log.info("Butler Core status response - pickId: {}, status: {}, isComplete: {}",
+            log.info("Butler Core status response - pickInstructionId: {}, status: {}, isComplete: {}",
                     response.getPickId(), response.getStatus(), response.getIsComplete());
 
             return response;

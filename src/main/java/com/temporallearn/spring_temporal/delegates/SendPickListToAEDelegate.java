@@ -12,14 +12,15 @@ import org.springframework.stereotype.Component;
 
 /**
  * Step 2 — Reads the PickInstruction from the "instructionJson" process variable,
- * persists it to ae_order (DB-first commit gate), then sends a PickListRequest to
- * AE via gor.pick-list.requests.
+ * then atomically persists ae_order and enqueues an outbox event for pick-list.requests.
  *
- * DB-first ordering guarantee:
- *   1. persistAeOrder()       — writes ae_order to postgres; throws on failure → Camunda retries
- *   2. sendPicklistOrderToAE() — publishes to Kafka; only reached after DB commit
+ * Transactional Outbox guarantee (single DB transaction):
+ *   persistAeOrder() writes ae_order + outbox_event atomically.
+ *   The OutboxRelayService publishes the PENDING outbox row to gor.pick-list.requests.
+ *   If the process crashes after DB commit, the relay re-publishes on next poll.
  *
- * Also invoked on RETRY — persistAeOrder() is idempotent (skips if record already exists).
+ * On Camunda RETRY: ae_order write is skipped (idempotent), outbox row is re-inserted
+ * so the message is re-published to AE.
  */
 @Component
 @Slf4j
@@ -41,17 +42,15 @@ public class SendPickListToAEDelegate implements JavaDelegate {
     public void execute(DelegateExecution execution) throws Exception {
         String instructionJson = (String) execution.getVariable("instructionJson");
         PickInstruction instruction = objectMapper.readValue(instructionJson, PickInstruction.class);
-        String pickId = instruction.getPickId();
+        String pickInstructionId = instruction.getPickInstructionId();
 
-        log.info("SendPickListToAEDelegate executing for pickId: {}", pickId);
+        log.info("SendPickListToAEDelegate executing for pickInstructionId: {}", pickInstructionId);
 
         // Step 1 — build PickListRequest (pure mapping, no I/O)
         PickListRequest request = pickListRequestMapper.toPickListRequest(instruction);
 
-        // Step 2 — DB commit gate: persist ae_order FIRST (throws on failure → no Kafka send)
-        pickInstructionService.persistAeOrder(pickId, request);
-
-        // Step 3 — DB committed; now safe to publish to AE
-        pickInstructionService.sendPicklistOrderToAE(pickId, request);
+        // Step 2 — atomically persist ae_order + enqueue outbox event (throws on failure → Camunda retries)
+        // OutboxRelayService publishes the PENDING row to gor.pick-list.requests asynchronously.
+        pickInstructionService.persistAeOrder(pickInstructionId, request);
     }
 }

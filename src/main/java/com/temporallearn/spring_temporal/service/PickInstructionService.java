@@ -4,13 +4,14 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.temporallearn.spring_temporal.dto.ItemPickedEvent;
 import com.temporallearn.spring_temporal.dto.PickInstruction;
-import com.temporallearn.spring_temporal.dto.TransactionUpdate;
 import com.temporallearn.spring_temporal.dto.ae.PickListEvent;
 import com.temporallearn.spring_temporal.dto.ae.PickListRequest;
 import com.temporallearn.spring_temporal.grpc.ButlerCoreGrpcClient;
 import com.temporallearn.spring_temporal.model.AeOrder;
+import com.temporallearn.spring_temporal.model.OutboxEvent;
 import com.temporallearn.spring_temporal.model.TransactionStatus;
 import com.temporallearn.spring_temporal.repository.AeOrderRepository;
+import com.temporallearn.spring_temporal.repository.OutboxEventRepository;
 import com.temporallearn.spring_temporal.repository.TransactionStatusRepository;
 import com.greyorange.butler.core.grpc.GetPickInstructionStatusResponse;
 
@@ -18,6 +19,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -37,6 +39,7 @@ public class PickInstructionService {
     private final ButlerCoreGrpcClient butlerCoreGrpcClient;
     private final TransactionStatusRepository transactionStatusRepository;
     private final AeOrderRepository aeOrderRepository;
+    private final OutboxEventRepository outboxEventRepository;
     private final ObjectMapper objectMapper;
     private final PickListRequestMapper pickListRequestMapper;
 
@@ -50,12 +53,14 @@ public class PickInstructionService {
                                   ButlerCoreGrpcClient butlerCoreGrpcClient,
                                   TransactionStatusRepository transactionStatusRepository,
                                   AeOrderRepository aeOrderRepository,
+                                  OutboxEventRepository outboxEventRepository,
                                   ObjectMapper objectMapper,
                                   PickListRequestMapper pickListRequestMapper) {
         this.kafkaTemplate = kafkaTemplate;
         this.butlerCoreGrpcClient = butlerCoreGrpcClient;
         this.transactionStatusRepository = transactionStatusRepository;
         this.aeOrderRepository = aeOrderRepository;
+        this.outboxEventRepository = outboxEventRepository;
         this.objectMapper = objectMapper;
         this.pickListRequestMapper = pickListRequestMapper;
     }
@@ -63,40 +68,47 @@ public class PickInstructionService {
     // ─── Step 2: Send to AE ──────────────────────────────────────────────────
 
     /**
-     * Persists the PickListRequest to ae_order BEFORE sending to Kafka.
-     * This is the DB-first commit gate: if DB write fails, the delegate throws
-     * and Camunda retries — no Kafka message is published.
+     * Atomically (within a single DB transaction):
+     *   1. Persist the PickListRequest to ae_order (idempotent — skips if already present).
+     *   2. Write an outbox_event row for the pick-list.requests Kafka publish.
      *
-     * The payload stored is the exact JSON of the PickListRequest sent to AE.
-     * Idempotent: if ae_order already exists for this pickId, skips the write.
+     * The OutboxRelayService picks up the PENDING outbox row and publishes to Kafka,
+     * guaranteeing delivery even if the process crashes between the DB write and Kafka send.
+     *
+     * On Camunda RETRY, step 1 is skipped (already persisted) but a new outbox row is
+     * written so the message is re-published — idempotent on the AE side by pickInstructionId.
      */
-    public void persistAeOrder(String pickId, PickListRequest request) {
-        if (aeOrderRepository.existsById(pickId)) {
-            log.info("ae_order already exists for pickId: {} — skipping persist (idempotent on RETRY)", pickId);
-            return;
-        }
+    @Transactional
+    public void persistAeOrder(String pickInstructionId, PickListRequest request) {
         try {
-            AeOrder order = new AeOrder();
-            order.setExternalServiceRequestId(pickId);
-            order.setPayload(objectMapper.writeValueAsString(request));
-            order.setCreatedAt(Instant.now());
-            order.setUpdatedAt(Instant.now());
-            aeOrderRepository.save(order);
-            log.info("Persisted ae_order for pickId: {}", pickId);
-        } catch (Exception e) {
-            log.error("Failed to persist ae_order for pickId: {}", pickId, e);
-            throw new RuntimeException("ae_order persist failed for pickId: " + pickId, e);
-        }
-    }
+            String requestJson = objectMapper.writeValueAsString(request);
 
-    /**
-     * Sends the pre-built PickListRequest to AE via gor.pick-list.requests.
-     * Must only be called AFTER persistAeOrder() succeeds (DB-first ordering).
-     * Also called on RETRY to re-send after a retriable failure.
-     */
-    public void sendPicklistOrderToAE(String pickId, PickListRequest request) {
-        kafkaTemplate.send(pickListRequestsTopic, pickId, request);
-        log.info("Sent PickListRequest to AE topic '{}' for pickId: {}", pickListRequestsTopic, pickId);
+            if (!aeOrderRepository.existsById(pickInstructionId)) {
+                AeOrder order = new AeOrder();
+                order.setExternalServiceRequestId(pickInstructionId);
+                order.setPayload(requestJson);
+                order.setCreatedAt(Instant.now());
+                order.setUpdatedAt(Instant.now());
+                aeOrderRepository.save(order);
+                log.info("Persisted ae_order for pickInstructionId: {}", pickInstructionId);
+            } else {
+                log.info("ae_order already exists for pickInstructionId: {} — skipping persist (idempotent on RETRY)", pickInstructionId);
+            }
+
+            // Enqueue outbox event in the same transaction — relay publishes to Kafka
+            outboxEventRepository.save(OutboxEvent.builder()
+                    .aggregateId(pickInstructionId)
+                    .topic(pickListRequestsTopic)
+                    .payload(requestJson)
+                    .status("PENDING")
+                    .createdAt(Instant.now())
+                    .build());
+            log.info("Enqueued pick-list.requests outbox event for pickInstructionId: {}", pickInstructionId);
+
+        } catch (Exception e) {
+            log.error("Failed to persist ae_order / outbox event for pickInstructionId: {}", pickInstructionId, e);
+            throw new RuntimeException("ae_order persist failed for pickInstructionId: " + pickInstructionId, e);
+        }
     }
 
     // ─── Step 3: Update ae_order from events ────────────────────────────────
@@ -113,12 +125,12 @@ public class PickInstructionService {
      * rare cases where the event arrives before the Camunda delegate has run).
      */
     public void updateAeOrderFromEvent(PickListEvent event) {
-        String pickId = event.getValue().getPayload().getExternalServiceRequestId();
+        String pickInstructionId = event.getValue().getPayload().getExternalServiceRequestId();
 
-        AeOrder order = aeOrderRepository.findById(pickId).orElseGet(() -> {
-            log.warn("ae_order not found for pickId: {} during event update — creating partial record", pickId);
+        AeOrder order = aeOrderRepository.findById(pickInstructionId).orElseGet(() -> {
+            log.warn("ae_order not found for pickInstructionId: {} during event update — creating partial record", pickInstructionId);
             AeOrder o = new AeOrder();
-            o.setExternalServiceRequestId(pickId);
+            o.setExternalServiceRequestId(pickInstructionId);
             o.setCreatedAt(Instant.now());
             return o;
         });
@@ -169,40 +181,216 @@ public class PickInstructionService {
             order.setPayload(objectMapper.writeValueAsString(payloadMap));
             order.setUpdatedAt(Instant.now());
             aeOrderRepository.save(order);
-            log.info("Updated ae_order for pickId: {}, state: {}", pickId, evtPayload.getState());
+            log.info("Updated ae_order for pickInstructionId: {}, state: {}", pickInstructionId, evtPayload.getState());
 
         } catch (Exception e) {
-            log.warn("Failed to update ae_order for pickId: {} — non-critical, continuing", pickId, e);
+            log.warn("Failed to update ae_order for pickInstructionId: {} — non-critical, continuing", pickInstructionId, e);
         }
     }
 
-    // ─── Step 4: Publish item picked event ──────────────────────────────────
+    // ─── Step 4: Process pick_transaction event atomically ──────────────────
+
+    /**
+     * Single atomic transaction for a complete pick_transaction event.
+     *
+     * <b>Pre-condition (before any write):</b> scans ALL (serviceRequest × transaction) pairs and
+     * checks each transactionId against transaction_status. If ANY transactionId is already SUCCESS
+     * (duplicate), the entire event is rejected — no ae_order update, no transaction_status writes,
+     * no outbox entries. Returns {@code false} so the delegate loops back to waitForTransactionUpdate
+     * and waits for the next valid pick_transaction event.
+     *
+     * <b>When all transactionIds are new,</b> atomically:
+     *   1. Update ae_order with actuals/state from the event.
+     *   2. For every (serviceRequest × transaction) pair:
+     *      a. Persist transaction_status.
+     *      b. Build ItemPickedEvent payload (reads ae_order updated in step 1).
+     *      c. Write an outbox_event row — OutboxRelayService publishes to item_picked.events.
+     *
+     * All writes commit or roll back together.
+     *
+     * @return {@code true} if fully processed; {@code false} if any txId was a duplicate (event rejected).
+     */
+    @Transactional
+    public boolean processPickTransaction(String pickInstructionId, PickListEvent event, PickInstruction pi) {
+        PickListEvent.Payload payload = event.getValue() != null ? event.getValue().getPayload() : null;
+        if (payload == null || payload.getServiceRequests() == null) {
+            log.warn("processPickTransaction — no serviceRequests in event for pickInstructionId: {}", pickInstructionId);
+            return true; // nothing to process, treat as handled
+        }
+
+        // ── Pre-check: reject entire event if any txId is already recorded ──────────────
+        for (PickListEvent.ServiceRequest sr : payload.getServiceRequests()) {
+            if (sr.getTransactions() == null) continue;
+            for (PickListEvent.Transaction tx : sr.getTransactions()) {
+                String txId = tx.getTransactionId();
+                if (txId != null && !txId.isEmpty()) {
+                    Optional<TransactionStatus> existing = transactionStatusRepository.findById(txId);
+                    if (existing.isPresent() && "SUCCESS".equals(existing.get().getStatus())) {
+                        log.warn("Duplicate txId: {} for pickInstructionId: {} — rejecting entire pick_transaction event " +
+                                 "(no AE order update, no item_picked events). " +
+                                 "Delegate will loop back to waitForTransactionUpdate.", txId, pickInstructionId);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // ── All txIds are new — proceed with all writes atomically ───────────────────────
+        // Step 1: update ae_order with actuals from the pick_transaction event
+        updateAeOrderFromEvent(event);
+
+        // Step 2: persist transaction_status + enqueue outbox per transaction
+        for (PickListEvent.ServiceRequest sr : payload.getServiceRequests()) {
+            if (sr.getTransactions() == null) continue;
+            for (PickListEvent.Transaction tx : sr.getTransactions()) {
+                validatePersistAndEnqueue(pickInstructionId, tx.getTransactionId(), pi, event);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Per-transaction: persist transaction_status → build + enqueue outbox event.
+     * Only called from {@link #processPickTransaction} after all txIds have passed
+     * the duplicate pre-check — no duplicate check needed here.
+     */
+    private void validatePersistAndEnqueue(String pickInstructionId, String txId, PickInstruction pi, PickListEvent event) {
+        log.info("validatePersistAndEnqueue — pickInstructionId: {}, txId: {}", pickInstructionId, txId);
+
+        // Persist transaction_status (PK constraint guards against races)
+        persistTransactionStatus(txId, pickInstructionId, "SUCCESS");
+
+        // Build ItemPickedEvent JSON — reads ae_order updated above in the same transaction
+        String eventJson = buildItemPickedEventJson(pickInstructionId, pi, event, txId);
+        if (eventJson == null) {
+            log.warn("Transaction {} not found in event payload for pickInstructionId: {} — outbox entry skipped", txId, pickInstructionId);
+            return;
+        }
+
+        // Save outbox event atomically with transaction_status
+        outboxEventRepository.save(OutboxEvent.builder()
+                .aggregateId(pickInstructionId)
+                .topic(itemPickedEventsTopic)
+                .payload(eventJson)
+                .status("PENDING")
+                .createdAt(Instant.now())
+                .build());
+
+        log.info("Enqueued ItemPickedEvent to outbox for pickInstructionId: {}, txId: {}", pickInstructionId, txId);
+    }
+
+    // ─── Mark complete / failed ─────────────────────────────────────────────
+
+    /**
+     * Mark the pick instruction as complete.
+     */
+    public void markPickInstructionComplete(String pickInstructionId) {
+        log.info("Finalizing Workflow: Pick Instruction {} is COMPLETE.", pickInstructionId);
+        // repository.updateStatus(pickInstructionId, "COMPLETED");
+    }
+
+    /**
+     * Mark the pick instruction as failed.
+     */
+    public void markPickInstructionFailed(String pickInstructionId, String transactionId, String failureReason) {
+        log.error("Pick Instruction FAILED - pickInstructionId: {}, transactionId: {}, reason: {}",
+                pickInstructionId, transactionId, failureReason);
+        // repository.updateStatus(pickInstructionId, "FAILED");
+        // repository.setFailureReason(pickInstructionId, failureReason);
+    }
+
+    // ─── Workflow completion ─────────────────────────────────────────────────
+
+    /**
+     * Run workflow completion cleanup: status validation against Butler Core and Kafka audit event.
+     */
+    public void onWorkflowComplete(String pickInstructionId, String internalStatus, String failureReason) {
+        log.info("Workflow completing for pickInstructionId: {} — running cleanup and validation. internalStatus: {}",
+                pickInstructionId, internalStatus);
+
+        String externalStatus = null;
+        boolean externalIsComplete = false;
+        try {
+            GetPickInstructionStatusResponse externalResponse =
+                    butlerCoreGrpcClient.getPickInstructionStatus(pickInstructionId);
+            externalStatus = externalResponse.getStatus();
+            externalIsComplete = externalResponse.getIsComplete();
+            log.info("External status from Butler Core — pickInstructionId: {}, status: {}, isComplete: {}, " +
+                            "totalQty: {}, processedQty: {}, remainingQty: {}",
+                    pickInstructionId, externalStatus, externalIsComplete,
+                    externalResponse.getTotalQty(),
+                    externalResponse.getProcessedQty(),
+                    externalResponse.getRemainingQty());
+        } catch (Exception e) {
+            log.warn("Failed to fetch external status from Butler Core for pickInstructionId: {}. " +
+                    "Proceeding with cleanup using internal status only.", pickInstructionId, e);
+        }
+
+        if (externalStatus != null) {
+            boolean statusMismatch = false;
+            if ("COMPLETED".equals(internalStatus) && !externalIsComplete) {
+                log.warn("STATUS MISMATCH — pickInstructionId: {} is COMPLETED internally but NOT complete in Butler Core (status: {})",
+                        pickInstructionId, externalStatus);
+                statusMismatch = true;
+            } else if ("FAILED".equals(internalStatus) && externalIsComplete) {
+                log.warn("STATUS MISMATCH — pickInstructionId: {} is FAILED internally but COMPLETE in Butler Core (status: {})",
+                        pickInstructionId, externalStatus);
+                statusMismatch = true;
+            } else if ("CANCELLED".equals(internalStatus) && externalIsComplete) {
+                log.warn("STATUS MISMATCH — pickInstructionId: {} is CANCELLED internally but COMPLETE in Butler Core (status: {})",
+                        pickInstructionId, externalStatus);
+                statusMismatch = true;
+            }
+            if (!statusMismatch) {
+                log.info("Status validation PASSED — pickInstructionId: {} internal [{}] consistent with external [{}]",
+                        pickInstructionId, internalStatus, externalStatus);
+            }
+        }
+
+        try {
+            Map<String, Object> auditEvent = new LinkedHashMap<>();
+            auditEvent.put("pickInstructionId", pickInstructionId);
+            auditEvent.put("internalStatus", internalStatus);
+            auditEvent.put("externalStatus", externalStatus);
+            auditEvent.put("externalIsComplete", externalIsComplete);
+            auditEvent.put("failureReason", failureReason);
+            auditEvent.put("timestamp", Instant.now().toString());
+            kafkaTemplate.send("workflow-complete-events-topic", pickInstructionId, auditEvent);
+            log.info("Published workflow-complete audit event to Kafka for pickInstructionId: {}", pickInstructionId);
+        } catch (Exception e) {
+            log.warn("Failed to publish workflow-complete audit event for pickInstructionId: {}. Non-critical.", pickInstructionId, e);
+        }
+
+        log.info("Workflow cleanup complete for pickInstructionId: {} — final status: {}", pickInstructionId, internalStatus);
+    }
+
+    // ─── Internal helpers ────────────────────────────────────────────────────
 
     /**
      * Finds the specific transaction by ID across all serviceRequests in the event,
-     * builds and publishes exactly one {@link ItemPickedEvent} for it.
+     * builds one {@link ItemPickedEvent}, and returns it serialized as JSON.
      *
-     * Must only be called AFTER validateAndPersist() succeeds for this transactionId
-     * (transaction_status commit gate — DB before Kafka).
+     * Returns {@code null} if the transaction is not found in the event payload.
      *
      * Field sources:
      *   - PPS fields (pps_id, seat_name, etc.)  — pickInstruction (Camunda process var)
      *   - item_uid, tpid                         — ae_order.payload (stored PickListRequest)
-     *   - transaction_id, state, picked_qty      — PickListEvent.Transaction (matched by transactionId)
+     *   - transaction_id, state, picked_qty      — PickListEvent.Transaction (matched by txId)
      */
-    public void publishItemPickedEvent(String pickId,
-                                       PickInstruction pi,
-                                       PickListEvent event,
-                                       String transactionId) {
-        AeOrder aeOrder = aeOrderRepository.findById(pickId)
+    private String buildItemPickedEventJson(String pickInstructionId,
+                                            PickInstruction pi,
+                                            PickListEvent event,
+                                            String transactionId) {
+        AeOrder aeOrder = aeOrderRepository.findById(pickInstructionId)
                 .orElseThrow(() -> new IllegalStateException(
-                        "ae_order not found for pickId: " + pickId + " — cannot build ItemPickedEvent"));
+                        "ae_order not found for pickInstructionId: " + pickInstructionId + " — cannot build ItemPickedEvent"));
 
         PickListRequest storedRequest;
         try {
             storedRequest = objectMapper.readValue(aeOrder.getPayload(), PickListRequest.class);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to deserialize ae_order payload for pickId: " + pickId, e);
+            throw new RuntimeException("Failed to deserialize ae_order payload for pickInstructionId: " + pickInstructionId, e);
         }
 
         String tpid = null;
@@ -210,7 +398,7 @@ public class PickInstructionService {
             tpid = storedRequest.getAttributes().getOrderOptions()
                     .getCustomerOrderInfo().getShipmentId();
         } catch (NullPointerException e) {
-            log.warn("Could not extract tpid from ae_order payload for pickId: {}", pickId);
+            log.warn("Could not extract tpid from ae_order payload for pickInstructionId: {}", pickInstructionId);
         }
 
         List<PickListEvent.ServiceRequest> serviceRequests =
@@ -218,8 +406,8 @@ public class PickInstructionService {
         List<PickListRequest.ServiceRequest> storedSRs = storedRequest.getServiceRequests();
 
         if (serviceRequests == null) {
-            log.warn("No serviceRequests in pick_transaction event for pickId: {} — skipping publish", pickId);
-            return;
+            log.warn("No serviceRequests in pick_transaction event for pickInstructionId: {} — skipping", pickInstructionId);
+            return null;
         }
 
         for (int i = 0; i < serviceRequests.size(); i++) {
@@ -240,8 +428,8 @@ public class PickInstructionService {
                                 .getProductAttributes()
                                 .getProductSku();
                     } catch (Exception e) {
-                        log.warn("Could not extract itemUid from ae_order serviceRequests[{}] for pickId: {}",
-                                i, pickId);
+                        log.warn("Could not extract itemUid from ae_order serviceRequests[{}] for pickInstructionId: {}",
+                                i, pickInstructionId);
                     }
                 }
 
@@ -253,13 +441,13 @@ public class PickInstructionService {
                         .itemUid(itemUid)
                         .uom(pi.getUom())
                         .pickedQty(pickedQty)
-                        .pickInstructionIds(List.of(pickId))
+                        .pickInstructionIds(List.of(pickInstructionId))
                         .build();
 
                 ItemPickedEvent evt = ItemPickedEvent.builder()
                         .ppsId(String.valueOf(pi.getPpsId()))
                         .seatName(pi.getSeatName())
-                        .orderId(pickId)
+                        .orderId(pickInstructionId)
                         .slotRef(pi.getSlotref())
                         .ppsBinId(pi.getBinId())
                         .userLoggedIn(pi.getUserLoggedIn())
@@ -270,154 +458,26 @@ public class PickInstructionService {
                         .pickedItemInfoList(List.of(itemInfo))
                         .build();
 
-                kafkaTemplate.send(itemPickedEventsTopic, pickId, evt);
-                log.info("Published ItemPickedEvent to '{}' for pickId: {}, txId: {}",
-                        itemPickedEventsTopic, pickId, transactionId);
-                return;
-            }
-        }
-
-        log.warn("Transaction {} not found in event for pickId: {} — no ItemPickedEvent published",
-                transactionId, pickId);
-    }
-
-    // ─── Mark complete / failed ─────────────────────────────────────────────
-
-    /**
-     * Mark the pick instruction as complete.
-     */
-    public void markPickInstructionComplete(String pickId) {
-        log.info("Finalizing Workflow: Pick Instruction {} is COMPLETE.", pickId);
-        // repository.updateStatus(pickId, "COMPLETED");
-    }
-
-    /**
-     * Mark the pick instruction as failed.
-     */
-    public void markPickInstructionFailed(String pickId, String transactionId, String failureReason) {
-        log.error("Pick Instruction FAILED - pickId: {}, transactionId: {}, reason: {}",
-                pickId, transactionId, failureReason);
-        // repository.updateStatus(pickId, "FAILED");
-        // repository.setFailureReason(pickId, failureReason);
-    }
-
-    // ─── Transaction idempotency gate ───────────────────────────────────────
-
-    /**
-     * Validates and persists a transaction update. This is the commit gate — Kafka publishing
-     * must only happen after this succeeds.
-     *
-     * Steps:
-     *   1. Duplicate check — if transactionId is already recorded as SUCCESS in DB, skip.
-     *   2. Persist to transaction_status with status SUCCESS.
-     *   3. Return whether the pick is now complete.
-     *
-     * @return Optional.empty()   if this is a duplicate — caller must NOT publish to Kafka.
-     *         Optional.of(true)  if persisted and pick is now complete.
-     *         Optional.of(false) if persisted and pick is still in progress.
-     */
-    public Optional<Boolean> validateAndPersist(String pickId, TransactionUpdate transactionUpdate) {
-        String txId = transactionUpdate.getTransactionId();
-
-        log.info("Validating transaction for pickId: {}, transactionId: {}, status: {}",
-                pickId, txId, transactionUpdate.getStatus());
-
-        // Step 1 — duplicate check
-        if (txId != null && !txId.isEmpty()) {
-            try {
-                Optional<TransactionStatus> existing = transactionStatusRepository.findById(txId);
-                if (existing.isPresent() && "SUCCESS".equals(existing.get().getStatus())) {
-                    log.warn("Duplicate transaction — txId: {} for pickId: {} already recorded as SUCCESS. Skipping.",
-                            txId, pickId);
-                    return Optional.empty();
+                try {
+                    return objectMapper.writeValueAsString(evt);
+                } catch (Exception e) {
+                    throw new RuntimeException(
+                            "Failed to serialize ItemPickedEvent for txId: " + transactionId, e);
                 }
-            } catch (Exception e) {
-                log.warn("Failed to check existing transaction status for txId: {} — proceeding with persist", txId, e);
             }
         }
 
-        // Step 2 — persist to DB (commit point; primary key constraint guards against races)
-        persistTransactionStatus(txId, pickId, "SUCCESS");
-
-        // Step 3 — completion check
-        boolean txComplete = "COMPLETED".equalsIgnoreCase(transactionUpdate.getStatus());
-        log.info("Transaction persisted for pickId: {}, txId: {}, txComplete: {}", pickId, txId, txComplete);
-        return Optional.of(txComplete);
+        log.warn("Transaction {} not found in event for pickInstructionId: {} — no ItemPickedEvent enqueued",
+                transactionId, pickInstructionId);
+        return null;
     }
 
-    // ─── Workflow completion ─────────────────────────────────────────────────
-
-    /**
-     * Run workflow completion cleanup: status validation against Butler Core and Kafka audit event.
-     */
-    public void onWorkflowComplete(String pickId, String internalStatus, String failureReason) {
-        log.info("Workflow completing for pickId: {} — running cleanup and validation. internalStatus: {}",
-                pickId, internalStatus);
-
-        String externalStatus = null;
-        boolean externalIsComplete = false;
-        try {
-            GetPickInstructionStatusResponse externalResponse =
-                    butlerCoreGrpcClient.getPickInstructionStatus(pickId);
-            externalStatus = externalResponse.getStatus();
-            externalIsComplete = externalResponse.getIsComplete();
-            log.info("External status from Butler Core — pickId: {}, status: {}, isComplete: {}, " +
-                            "totalQty: {}, processedQty: {}, remainingQty: {}",
-                    pickId, externalStatus, externalIsComplete,
-                    externalResponse.getTotalQty(),
-                    externalResponse.getProcessedQty(),
-                    externalResponse.getRemainingQty());
-        } catch (Exception e) {
-            log.warn("Failed to fetch external status from Butler Core for pickId: {}. " +
-                    "Proceeding with cleanup using internal status only.", pickId, e);
-        }
-
-        if (externalStatus != null) {
-            boolean statusMismatch = false;
-            if ("COMPLETED".equals(internalStatus) && !externalIsComplete) {
-                log.warn("STATUS MISMATCH — pickId: {} is COMPLETED internally but NOT complete in Butler Core (status: {})",
-                        pickId, externalStatus);
-                statusMismatch = true;
-            } else if ("FAILED".equals(internalStatus) && externalIsComplete) {
-                log.warn("STATUS MISMATCH — pickId: {} is FAILED internally but COMPLETE in Butler Core (status: {})",
-                        pickId, externalStatus);
-                statusMismatch = true;
-            } else if ("CANCELLED".equals(internalStatus) && externalIsComplete) {
-                log.warn("STATUS MISMATCH — pickId: {} is CANCELLED internally but COMPLETE in Butler Core (status: {})",
-                        pickId, externalStatus);
-                statusMismatch = true;
-            }
-            if (!statusMismatch) {
-                log.info("Status validation PASSED — pickId: {} internal [{}] consistent with external [{}]",
-                        pickId, internalStatus, externalStatus);
-            }
-        }
-
-        try {
-            Map<String, Object> auditEvent = new LinkedHashMap<>();
-            auditEvent.put("pickId", pickId);
-            auditEvent.put("internalStatus", internalStatus);
-            auditEvent.put("externalStatus", externalStatus);
-            auditEvent.put("externalIsComplete", externalIsComplete);
-            auditEvent.put("failureReason", failureReason);
-            auditEvent.put("timestamp", Instant.now().toString());
-            kafkaTemplate.send("workflow-complete-events-topic", pickId, auditEvent);
-            log.info("Published workflow-complete audit event to Kafka for pickId: {}", pickId);
-        } catch (Exception e) {
-            log.warn("Failed to publish workflow-complete audit event for pickId: {}. Non-critical.", pickId, e);
-        }
-
-        log.info("Workflow cleanup complete for pickId: {} — final status: {}", pickId, internalStatus);
-    }
-
-    // ─── Internal helpers ────────────────────────────────────────────────────
-
-    private void persistTransactionStatus(String txId, String pickId, String status) {
+    private void persistTransactionStatus(String txId, String pickInstructionId, String status) {
         if (txId == null || txId.isEmpty()) {
             return;
         }
         try {
-            TransactionStatus ts = new TransactionStatus(txId, pickId, status, Instant.now());
+            TransactionStatus ts = new TransactionStatus(txId, pickInstructionId, status, Instant.now());
             transactionStatusRepository.save(ts);
         } catch (Exception e) {
             log.warn("Failed to persist transaction status {} for txId: {}", status, txId, e);
