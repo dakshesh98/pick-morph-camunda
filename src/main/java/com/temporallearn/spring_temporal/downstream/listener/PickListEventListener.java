@@ -27,9 +27,9 @@ import org.springframework.stereotype.Service;
  *   then correlates the Camunda signal with the resolved command (UPDATE or COMPLETE).
  *
  * State mapping:
- *   event_type = "pick_transaction"              → command = UPDATE
- *   event_type = "update", state = "complete"    → command = COMPLETE
- *   event_type = "update", any other state       → command = UPDATE
+ *   event_type = "pick_transaction"                          → command = UPDATE (or COMPLETE if released)
+ *   event_type = "update", derivedOrderStatus = "released"  → command = COMPLETE
+ *   event_type = "update", any other derivedOrderStatus     → command = UPDATE
  */
 @Service
 @Slf4j
@@ -84,24 +84,19 @@ public class PickListEventListener {
             correlatePickTransaction(payload, pickInstructionId);
         } else {
             // update events: ae_order updated here (no transaction_status involved)
-            pickInstructionService.updateAeOrderFromEvent(event);
-            String command = resolveCommand(eventType, orderState, subState);
-            log.info("AE update event | pickInstructionId: {} | command: {} | state: {} | sub_state: {}",
-                    pickInstructionId, command, orderState, subState);
-            correlateUpdateEvent(command, eventType, subState, pickInstructionId);
+            String derivedOrderStatus = pickInstructionService.updateAeOrderFromEvent(event);
+            String command = resolveCommand(derivedOrderStatus);
+            log.info("AE update event | pickInstructionId: {} | command: {} | state: {} | sub_state: {} | derivedStatus: {}",
+                    pickInstructionId, command, orderState, subState, derivedOrderStatus);
+            correlateUpdateEvent(command, eventType, subState, pickInstructionId, payload);
         }
     }
 
     // ── State mapping ────────────────────────────────────────────────────────
 
-    /** Resolves the Camunda command for non-pick_transaction (update) events. */
-    private String resolveCommand(String eventType, String orderState, String subState) {
-        if ("update".equalsIgnoreCase(eventType)
-                && "complete".equalsIgnoreCase(orderState)
-                && "complete".equalsIgnoreCase(subState)) {
-            return "COMPLETE";
-        }
-        return "UPDATE";
+    /** Resolves the Camunda command: COMPLETE when derived order status is released, UPDATE otherwise. */
+    private String resolveCommand(String derivedOrderStatus) {
+        return "released".equals(derivedOrderStatus) ? "COMPLETE" : "UPDATE";
     }
 
     // ── Camunda correlation ──────────────────────────────────────────────────
@@ -127,14 +122,15 @@ public class PickListEventListener {
         }
     }
 
-    /** Correlates a non-pick_transaction (update) event — only command + aeEventType, no transactionUpdateJson. */
-    private void correlateUpdateEvent(String command, String eventType, String subState, String pickInstructionId) {
+    /** Correlates a non-pick_transaction (update) event — passes raw event JSON so the delegate can enqueue order updates. */
+    private void correlateUpdateEvent(String command, String eventType, String subState, String pickInstructionId, String rawEventJson) {
         try {
             runtimeService.createMessageCorrelation("ItemPickingEventMessage")
                     .processInstanceVariableEquals("pickInstructionId", pickInstructionId)
                     .setVariable("command", command)
                     .setVariable("aeEventType", eventType)
                     .setVariable("failureReason", subState)
+                    .setVariable("pickListEventJson", rawEventJson.getBytes(java.nio.charset.StandardCharsets.UTF_8))
                     .correlate();
             log.info("ItemPickingEventMessage correlated for update event | pickInstructionId: {} | command: {}", pickInstructionId, command);
         } catch (MismatchingMessageCorrelationException e) {

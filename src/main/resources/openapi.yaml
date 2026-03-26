@@ -85,62 +85,45 @@ components:
   schemas:
     PickInstruction:
       type: object
+      description: Pick instruction event — received via Kafka (gor.pick-instruction.events) or REST (POST /Order/pick_instruction)
       properties:
-        pickInstructionId:
+        id:
           type: string
-          description: Used as WorkflowId and OrderId
-        item:
+          description: Pick instruction ID — used as WorkflowId and OrderId
+        order_id:
           type: string
-        tpid:
-          type: string
-        scannableBarcodes:
-          type: array
-          items:
-            type: string
-        pickLocation:
-          type: string
-        dropLocation:
-          type: string
-        uom:
+        orderline_id:
           type: string
         qty:
           type: integer
           format: int32
-      required: [pickInstructionId, item, tpid, uom, qty]
-    Order:
-      type: object
-      properties:
-        orderId:
+        slot_id:
           type: string
-          description: Same as pick instruction ID
-        orderLines:
-          type: array
-          items:
-            $ref: '#/components/schemas/OrderLine'
-      required: [orderId, orderLines]
-    OrderLine:
-      type: object
-      properties:
-        pickInstructionId:
-          type: string
-        item:
+          description: Inventory location slot
+        uom:
           type: string
         tpid:
           type: string
-        uom:
+        item_id:
           type: string
-        qty:
+        pps_id:
           type: integer
           format: int32
-        scannableBarcodes:
-          type: array
-          items:
-            type: string
-        pickLocation:
+        bin_id:
           type: string
-        dropLocation:
-          type: string
-      required: [pickInstructionId, item, tpid, uom, qty]
+        extra_fields:
+          type: object
+          properties:
+            barcodes:
+              type: array
+              items:
+                type: string
+              description: LPN / marked-container barcodes
+            product_sku:
+              type: string
+            seat_name:
+              type: string
+      required: [id, order_id, orderline_id, qty, slot_id, uom, tpid, item_id, pps_id, bin_id]
     ValidationResult:
       type: object
       properties:
@@ -177,15 +160,42 @@ components:
         additionalInfo:
           type: string
       required: [pickInstructionId, transactionId, command, status]
+    OrderUpdateEvent:
+      type: object
+      description: >
+        Published to <tenant>.order_update.events for every AE pick-list event
+        (both event_type=update and event_type=pick_transaction).
+      properties:
+        pick_instruction_id:
+          type: string
+          description: Internal pick instruction identifier
+        transaction_id:
+          type: string
+          description: Same as pick_instruction_id — the pick instruction identifier
+        order_id:
+          type: string
+          description: Customer order ID from PickInstruction
+        orderline_id:
+          type: string
+          description: Customer orderline ID from PickInstruction
+        state:
+          type: string
+          description: AE order state (e.g. cancellation_locked, pick_transaction, complete)
+        sub_state:
+          type: string
+          description: AE order sub_state (e.g. created, in_palletization, fully_palletized)
+        actuals:
+          type: object
+          description: Per-orderline actuals from the AE pick-list event
+      required: [pick_instruction_id, order_id, orderline_id, state]
   # Kafka message descriptions
   x-kafka:
     topics:
-      my-topic:
+      pick-instruction.events:
         direction: inbound
-        description: Triggers creation of a new PickInstruction workflow based on pickInstructionId in the message body.
+        description: Triggers creation of a new pick instruction workflow. JSON payload matches PickInstruction schema.
         payload:
-          type: string
-          description: Raw pickInstructionId string used to populate PickInstruction
+          $ref: '#/components/schemas/PickInstruction'
       transaction-updates-topic:
         direction: inbound
         description: Transaction updates consumed by TransactionUpdateListener.
@@ -196,3 +206,10 @@ components:
         description: Validation results consumed by ValidationResultListener.
         payload:
           $ref: '#/components/schemas/ValidationResult'
+      order_update.events:
+        direction: outbound
+        description: >
+          Published for every AE pick-list event (update and pick_transaction).
+          Consumed by Butler Core to call make_and_send_order_related_notifications.
+        payload:
+          $ref: '#/components/schemas/OrderUpdateEvent'

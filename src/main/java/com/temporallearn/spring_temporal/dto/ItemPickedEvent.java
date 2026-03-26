@@ -18,7 +18,8 @@ import java.util.List;
  * Field sources:
  *   - PPS fields (pps_id, seat_name, pps_bin_id, etc.)  — pickInstruction Camunda process variable
  *   - item_uid, tpid                                     — ae_order.payload (stored PickListRequest)
- *   - transaction_id, state, picked_qty                  — PickListEvent.Transaction (from AE event)
+ *   - transaction_id                                      — pickInstructionId (same as order_id)
+ *   - state, picked_qty                                  — PickListEvent.Transaction (from AE event)
  */
 @Data
 @Builder

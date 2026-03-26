@@ -13,11 +13,11 @@ import java.util.List;
  *
  * Field mapping rationale:
  *   pickInstructionId          → externalServiceRequestId (single order per instruction)
- *   dropLocation    → fulfillmentArea + destinationGroup (drop zone is the fulfilment destination)
+ *   fulfillmentArea → hardcoded "assist_area" (per LLD)
  *   tpid            → shipmentId (transport plan ID maps to AE shipment concept)
- *   pickLocation    → location fields (raw address; AE parses sub-fields on their side)
- *   scannableBarcodes → productAttributes.barcodes (LPN/marked-container barcodes)
- *   item            → product_sku
+ *   slotLocation    → location fields (raw address; AE parses sub-fields on their side)
+ *   extraFields.barcodes    → productAttributes.barcodes (LPN/marked-container barcodes)
+ *   extraFields.productSku  → product_sku
  *   qty             → productQuantity
  *   binId           → bin_grouping_tag (used by AE for bin-level grouping)
  */
@@ -28,7 +28,7 @@ public class PickListRequestMapper {
         return PickListRequest.builder()
                 .externalServiceRequestId(pi.getPickInstructionId())
                 .type("PICK")
-                .fulfillmentArea(List.of(pi.getDropLocation()))
+                .fulfillmentArea(List.of("assist_area"))
                 .attributes(buildTopLevelAttributes(pi))
                 .serviceRequests(List.of(buildServiceRequest(pi)))
                 .build();
@@ -63,7 +63,7 @@ public class PickListRequestMapper {
                         .build())
                 .bintags(Collections.emptyList())
                 .containerType("")
-                .destinationGroup(pi.getDropLocation())
+                .destinationGroup("")
                 .simplePriority("NORMAL")
                 .behaviours(Collections.emptyList())
                 .build();
@@ -85,14 +85,14 @@ public class PickListRequestMapper {
                         .build())
                 .shelfLifeHours(0)
                 .location(PickListRequest.Location.builder()
-                        .displayName(pi.getPickLocation())
-                        .fullAddress(pi.getPickLocation())
+                        .displayName(pi.getSlotLocation())
+                        .fullAddress(pi.getSlotLocation())
                         .addressFields(PickListRequest.AddressFields.builder()
-                                .side(pi.getPickLocation())
-                                .zone(pi.getPickLocation())
-                                .level(pi.getPickLocation())
-                                .bay(pi.getPickLocation())
-                                .aisle(pi.getPickLocation())
+                                .side(pi.getSlotLocation())
+                                .zone(pi.getSlotLocation())
+                                .level(pi.getSlotLocation())
+                                .bay(pi.getSlotLocation())
+                                .aisle(pi.getSlotLocation())
                                 .build())
                         .build())
                 .build();
@@ -102,8 +102,8 @@ public class PickListRequestMapper {
         PickListRequest.ProductAttributes productAttributes = PickListRequest.ProductAttributes.builder()
                 .lotId("")
                 .filterParameters(Collections.emptyList())
-                .barcodes(pi.getScannableBarcodes() != null ? pi.getScannableBarcodes() : Collections.emptyList())
-                .productSku(pi.getItem())
+                .barcodes(pi.getExtraFields() != null && pi.getExtraFields().getBarcodes() != null ? pi.getExtraFields().getBarcodes() : Collections.emptyList())
+                .productSku(pi.getExtraFields() != null ? pi.getExtraFields().getProductSku() : null)
                 .packageParameters(Collections.emptyList())
                 .build();
 

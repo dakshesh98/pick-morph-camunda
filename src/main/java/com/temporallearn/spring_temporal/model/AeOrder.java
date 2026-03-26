@@ -48,6 +48,14 @@ public class AeOrder {
     @Column(columnDefinition = "jsonb", nullable = false)
     private String payload;
 
+    /** Derived order status: created | pending | complete | released. Updated on every event. */
+    @Column(name = "status", nullable = false)
+    private String status;
+
+    /** AE order state from the pick-list event root (e.g. cancellation_locked, fulfillable, pick_transaction, complete). */
+    @Column(name = "state")
+    private String state;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 

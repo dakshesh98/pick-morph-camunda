@@ -3,6 +3,7 @@ package com.temporallearn.spring_temporal.service;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.temporallearn.spring_temporal.dto.ItemPickedEvent;
+import com.temporallearn.spring_temporal.dto.OrderUpdateEvent;
 import com.temporallearn.spring_temporal.dto.PickInstruction;
 import com.temporallearn.spring_temporal.dto.ae.PickListEvent;
 import com.temporallearn.spring_temporal.dto.ae.PickListRequest;
@@ -49,6 +50,9 @@ public class PickInstructionService {
     @Value("${kafka.topic.item-picked-events}")
     private String itemPickedEventsTopic;
 
+    @Value("${kafka.topic.order-update-events}")
+    private String orderUpdateEventsTopic;
+
     public PickInstructionService(KafkaTemplate<String, Object> kafkaTemplate,
                                   ButlerCoreGrpcClient butlerCoreGrpcClient,
                                   TransactionStatusRepository transactionStatusRepository,
@@ -81,12 +85,33 @@ public class PickInstructionService {
     @Transactional
     public void persistAeOrder(String pickInstructionId, PickListRequest request) {
         try {
+            // Kafka outbox payload — clean PickListRequest (no internal status fields)
             String requestJson = objectMapper.writeValueAsString(request);
 
+            // ae_order payload — same structure with OL status injected
+            @SuppressWarnings("unchecked")
+            Map<String, Object> payloadMap = objectMapper.convertValue(
+                    request, new TypeReference<Map<String, Object>>() {});
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> storedSRs =
+                    (List<Map<String, Object>>) payloadMap.get("serviceRequests");
+            if (storedSRs != null) {
+                for (Map<String, Object> storedSR : storedSRs) {
+                    storedSR.put("status", AEOrderTransformer.computeOlStatus(storedSR));
+                }
+                String orderStatus = AEOrderTransformer.computeOrderStatus(storedSRs);
+                payloadMap.put("status", orderStatus);
+                log.info("Status injected on creation — pickInstructionId: {}, orderStatus: {}", pickInstructionId, orderStatus);
+            }
+            String aeOrderPayloadJson = objectMapper.writeValueAsString(payloadMap);
+
             if (!aeOrderRepository.existsById(pickInstructionId)) {
+                String creationOrderStatus = AEOrderTransformer.computeOrderStatus(storedSRs);
                 AeOrder order = new AeOrder();
                 order.setExternalServiceRequestId(pickInstructionId);
-                order.setPayload(requestJson);
+                order.setPayload(aeOrderPayloadJson);
+                order.setStatus(creationOrderStatus != null ? creationOrderStatus : "created");
+                order.setState("created");
                 order.setCreatedAt(Instant.now());
                 order.setUpdatedAt(Instant.now());
                 aeOrderRepository.save(order);
@@ -124,8 +149,15 @@ public class PickInstructionService {
      * Creates a minimal ae_order record if one doesn't exist yet (guards against
      * rare cases where the event arrives before the Camunda delegate has run).
      */
-    public void updateAeOrderFromEvent(PickListEvent event) {
+    /**
+     * Result of processPickTransaction — carries both the duplicate-rejection flag
+     * and the derived order status so callers can decide on workflow completion.
+     */
+    public record ProcessResult(boolean processed, String orderStatus) {}
+
+    public String updateAeOrderFromEvent(PickListEvent event) {
         String pickInstructionId = event.getValue().getPayload().getExternalServiceRequestId();
+        String computedOrderStatus = "created";
 
         AeOrder order = aeOrderRepository.findById(pickInstructionId).orElseGet(() -> {
             log.warn("ae_order not found for pickInstructionId: {} during event update — creating partial record", pickInstructionId);
@@ -195,14 +227,30 @@ public class PickInstructionService {
                 }
             }
 
+            // ── Level 3: inject OL status per SR, then derive and inject order status ─
+            if (storedSRs != null) {
+                for (Map<String, Object> storedSR : storedSRs) {
+                    storedSR.put("status", AEOrderTransformer.computeOlStatus(storedSR));
+                }
+                computedOrderStatus = AEOrderTransformer.computeOrderStatus(storedSRs);
+                payloadMap.put("status", computedOrderStatus);
+                log.info("Status injected — pickInstructionId: {}, orderStatus: {}", pickInstructionId, computedOrderStatus);
+            }
+
             order.setPayload(objectMapper.writeValueAsString(payloadMap));
+            order.setStatus(computedOrderStatus);
+            if (evtPayload.getState() != null) {
+                order.setState(evtPayload.getState());
+            }
             order.setUpdatedAt(Instant.now());
             aeOrderRepository.save(order);
-            log.info("Updated ae_order for pickInstructionId: {}, state: {}", pickInstructionId, evtPayload.getState());
+            log.info("Updated ae_order for pickInstructionId: {}, aeState: {}, orderStatus: {}",
+                    pickInstructionId, evtPayload.getState(), computedOrderStatus);
 
         } catch (Exception e) {
             log.warn("Failed to update ae_order for pickInstructionId: {} — non-critical, continuing", pickInstructionId, e);
         }
+        return computedOrderStatus;
     }
 
     // ─── Step 4: Process pick_transaction event atomically ──────────────────
@@ -228,11 +276,11 @@ public class PickInstructionService {
      * @return {@code true} if fully processed; {@code false} if any txId was a duplicate (event rejected).
      */
     @Transactional
-    public boolean processPickTransaction(String pickInstructionId, PickListEvent event, PickInstruction pi) {
+    public ProcessResult processPickTransaction(String pickInstructionId, PickListEvent event, PickInstruction pi) {
         PickListEvent.Payload payload = event.getValue() != null ? event.getValue().getPayload() : null;
         if (payload == null || payload.getServiceRequests() == null) {
             log.warn("processPickTransaction — no serviceRequests in event for pickInstructionId: {}", pickInstructionId);
-            return true; // nothing to process, treat as handled
+            return new ProcessResult(true, "created"); // nothing to process, treat as handled
         }
 
         // ── Pre-check: reject entire event if any txId is already recorded ──────────────
@@ -246,7 +294,7 @@ public class PickInstructionService {
                         log.warn("Duplicate txId: {} for pickInstructionId: {} — rejecting entire pick_transaction event " +
                                  "(no AE order update, no item_picked events). " +
                                  "Delegate will loop back to waitForTransactionUpdate.", txId, pickInstructionId);
-                        return false;
+                        return new ProcessResult(false, null);
                     }
                 }
             }
@@ -254,7 +302,7 @@ public class PickInstructionService {
 
         // ── All txIds are new — proceed with all writes atomically ───────────────────────
         // Step 1: update ae_order with actuals from the pick_transaction event
-        updateAeOrderFromEvent(event);
+        String orderStatus = updateAeOrderFromEvent(event);
 
         // Step 2: persist transaction_status + enqueue outbox per transaction
         for (PickListEvent.ServiceRequest sr : payload.getServiceRequests()) {
@@ -264,7 +312,7 @@ public class PickInstructionService {
             }
         }
 
-        return true;
+        return new ProcessResult(true, orderStatus);
     }
 
     /**
@@ -391,6 +439,52 @@ public class PickInstructionService {
         log.info("Workflow cleanup complete for pickInstructionId: {} — final status: {}", pickInstructionId, internalStatus);
     }
 
+    // ─── Order update notifications ─────────────────────────────────────────
+
+    /**
+     * Publishes one {@link OrderUpdateEvent} per serviceRequest to the order_update.events topic
+     * via the transactional outbox. Called for both update and pick_transaction events so
+     * Butler Core can call make_and_send_order_related_notifications for its business orders.
+     *
+     * order_id / orderline_id come from the PickInstruction (customer order IDs),
+     * not from the AE pick-list event.
+     */
+    @Transactional
+    public void enqueueOrderUpdate(String pickInstructionId, PickInstruction pi, PickListEvent event) {
+        PickListEvent.Payload payload = event.getValue() != null ? event.getValue().getPayload() : null;
+        if (payload == null || payload.getServiceRequests() == null) return;
+
+        String state    = payload.getState();
+        String subState = payload.getAttributes() != null ? payload.getAttributes().getSubState() : null;
+
+        for (PickListEvent.ServiceRequest sr : payload.getServiceRequests()) {
+            try {
+                String orderUpdateTxId = buildTransactionId(pickInstructionId, sr.getActuals());
+                OrderUpdateEvent update = OrderUpdateEvent.builder()
+                        .pickInstructionId(pickInstructionId)
+                        .transactionId(orderUpdateTxId)
+                        .orderId(pi.getOrderId())
+                        .orderlineId(pi.getOrderlineId())
+                        .state(state)
+                        .subState(subState)
+                        .actuals(sr.getActuals())
+                        .build();
+                outboxEventRepository.save(OutboxEvent.builder()
+                        .aggregateId(pickInstructionId)
+                        .topic(orderUpdateEventsTopic)
+                        .payload(objectMapper.writeValueAsString(update))
+                        .status("PENDING")
+                        .createdAt(Instant.now())
+                        .build());
+                log.info("Enqueued OrderUpdateEvent | pickInstructionId: {} | orderline: {} | state: {} | sub_state: {}",
+                        pickInstructionId, sr.getExternalServiceRequestId(), state, subState);
+            } catch (Exception e) {
+                log.warn("Failed to enqueue OrderUpdateEvent for pickInstructionId: {}, orderline: {} — non-critical",
+                        pickInstructionId, sr.getExternalServiceRequestId(), e);
+            }
+        }
+    }
+
     // ─── Internal helpers ────────────────────────────────────────────────────
 
     /**
@@ -466,6 +560,12 @@ public class PickInstructionService {
                 int pickedQty = (tx.getContainerAttributes() != null)
                         ? tx.getContainerAttributes().getQtyPicked() : 0;
 
+                Long internalOrderId = (tx.getContainerAttributes() != null)
+                        ? tx.getContainerAttributes().getInternalOrderId() : null;
+                String itemPickedTxId = (internalOrderId != null)
+                        ? pickInstructionId + "_" + internalOrderId
+                        : pickInstructionId;
+
                 ItemPickedEvent.PickedItemInfo itemInfo = ItemPickedEvent.PickedItemInfo.builder()
                         .tpid(tpid)
                         .itemUid(itemUid)
@@ -476,17 +576,14 @@ public class PickInstructionService {
 
                 ItemPickedEvent evt = ItemPickedEvent.builder()
                         .ppsId(String.valueOf(pi.getPpsId()))
-                        .seatName(pi.getSeatName())
+                        .seatName(pi.getExtraFields() != null ? pi.getExtraFields().getSeatName() : null)
                         .orderId(pickInstructionId)
-                        .slotRef(pi.getSlotref())
+                        .slotRef(pi.getSlotLocation())
                         .ppsBinId(pi.getBinId())
-                        .userLoggedIn(pi.getUserLoggedIn())
-                        .ppsPoint(pi.getPpsPoint())
-                        .isMarkedContainerFlow(pi.isMarkedContainerScanned())
-                        .transactionId(tx.getContainerAttributes() != null
-                                && tx.getContainerAttributes().getInternalOrderId() != null
-                                ? String.valueOf(tx.getContainerAttributes().getInternalOrderId())
-                                : tx.getTransactionId())
+                        .userLoggedIn(null)
+                        .ppsPoint(null)
+                        .isMarkedContainerFlow(false)
+                        .transactionId(itemPickedTxId)
                         .state(tx.getTransactionState())
                         .danglingArea("bot")
                         .pickedItemInfoList(List.of(itemInfo))
@@ -504,6 +601,31 @@ public class PickInstructionService {
         log.warn("Transaction {} not found in event for pickInstructionId: {} — no ItemPickedEvent enqueued",
                 transactionId, pickInstructionId);
         return null;
+    }
+
+    /**
+     * Builds a transaction_id as "{pickInstructionId}_{internalOrderId}" when internal_order_id
+     * is present in the first actuals container; falls back to pickInstructionId alone.
+     */
+    @SuppressWarnings("unchecked")
+    private String buildTransactionId(String pickInstructionId, Object actuals) {
+        try {
+            if (actuals instanceof Map) {
+                List<?> containers = (List<?>) ((Map<?, ?>) actuals).get("containers");
+                if (containers != null && !containers.isEmpty()) {
+                    Map<?, ?> containerAttrs = (Map<?, ?>) ((Map<?, ?>) containers.get(0)).get("containerAttributes");
+                    if (containerAttrs != null) {
+                        Object internalOrderId = containerAttrs.get("internal_order_id");
+                        if (internalOrderId != null) {
+                            return pickInstructionId + "_" + internalOrderId;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Could not extract internal_order_id from actuals for pickInstructionId: {} — using id only", pickInstructionId);
+        }
+        return pickInstructionId;
     }
 
     private void persistTransactionStatus(String txId, String pickInstructionId, String status,

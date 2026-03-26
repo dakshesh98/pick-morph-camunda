@@ -19,6 +19,22 @@ This script:
 
 App is available at `http://localhost:9191` once healthy.
 
+## Rule: keep openapi.yaml in sync with API/Kafka contracts
+
+**Whenever any of the following change**, update `src/main/resources/openapi.yaml` to reflect the new contract:
+
+- REST endpoint request/response payloads (controllers under `controller/`)
+- Kafka inbound message DTOs (listeners under `downstream/listener/`)
+- Kafka outbound message DTOs (e.g. `PickListRequest`, `ItemPickedEvent`)
+- Any DTO under `dto/` that is part of a public API or Kafka topic
+
+What to update in `openapi.yaml`:
+- `components/schemas` — add, remove, or modify schema fields to match the DTO's `@JsonProperty` names
+- `x-kafka.topics` — update payload `$ref` or inline schema if topic contract changes
+- `paths` — update request/response schemas if REST endpoint signatures change
+
+---
+
 ## BPMN Viewer
 
 The BPMN viewer lives at `.claude/bpmn-viewer/index.html` and is served via `python3 -m http.server 5500` (configured in `../.claude/launch.json`).

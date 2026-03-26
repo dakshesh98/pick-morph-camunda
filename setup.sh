@@ -20,10 +20,12 @@ KAFKA="${PROJECT}-kafka-1"
 SPRING="${PROJECT}-spring-camunda-1"
 
 KAFKA_TOPICS=(
+  "gor.pick-instruction.events"
   "gor.pick-list.requests"
   "gor.pick-list.response"
   "gor.pick-list.events"
   "gor.item_picked.events"
+  "gor.order_update.events"
 )
 
 # ── helpers ──────────────────────────────────────────────────

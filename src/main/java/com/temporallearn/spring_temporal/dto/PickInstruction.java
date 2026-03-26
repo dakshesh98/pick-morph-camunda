@@ -1,26 +1,57 @@
 package com.temporallearn.spring_temporal.dto;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import java.util.List;
 
 import lombok.Data;
 
 @Data
 public class PickInstruction {
+
+    // ── (pick-instruction.events Kafka contract) ──────────────────
+    @JsonProperty("id")
     private String pickInstructionId;               // Used as WorkflowId and OrderId
-    private String item;
-    private String tpid;
-    private List<String> scannableBarcodes;
-    private String pickLocation;
-    private String dropLocation;
-    private String uom;
+
+    @JsonProperty("order_id")
+    private String orderId;
+
+    @JsonProperty("orderline_id")
+    private String orderlineId;
+
+    @JsonProperty("qty")
     private int qty;
 
-    // PPS-related fields required by Butler Core
-    private int ppsId;                   // PPS station ID
-    private String binId;                // Bin ID within the PPS
-    private String ppsPoint;             // PPS point identifier
-    private String seatName;             // Seat/station name
-    private String slotref;              // Slot reference
-    private String userLoggedIn;         // User logged in at PPS
-    private boolean markedContainerScanned; // Whether container was scanned
+    @JsonProperty("slot_id")
+    private String slotLocation;                    // Inventory location slot
+
+    @JsonProperty("uom")
+    private String uom;
+
+    @JsonProperty("tpid")
+    private String tpid;
+
+    @JsonProperty("item_id")
+    private String itemId;
+
+    @JsonProperty("pps_id")
+    private int ppsId;                              // PPS station ID
+
+    @JsonProperty("bin_id")
+    private String binId;                           // Bin ID within the PPS
+
+    @JsonProperty("extra_fields")
+    private ExtraFields extraFields;
+
+    @Data
+    public static class ExtraFields {
+
+        @JsonProperty("barcodes")
+        private List<String> barcodes;              // LPN / marked-container barcodes
+
+        @JsonProperty("product_sku")
+        private String productSku;                  // Product SKU
+
+        @JsonProperty("seat_name")
+        private String seatName;                    // Seat/station name at PPS
+    }
 }

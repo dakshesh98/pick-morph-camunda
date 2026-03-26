@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.temporallearn.spring_temporal.dto.PickInstruction;
 import com.temporallearn.spring_temporal.dto.ae.PickListEvent;
 import com.temporallearn.spring_temporal.service.PickInstructionService;
+import com.temporallearn.spring_temporal.service.PickInstructionService.ProcessResult;
 import lombok.extern.slf4j.Slf4j;
 import org.camunda.bpm.engine.delegate.DelegateExecution;
 import org.camunda.bpm.engine.delegate.JavaDelegate;
@@ -49,24 +50,29 @@ public class SendItemPickedEventDelegate implements JavaDelegate {
 
         log.info("SendItemPickedEventDelegate executing for pickInstructionId: {}, aeEventType: {}", pickInstructionId, aeEventType);
 
+        String instructionJson = (String) execution.getVariable("instructionJson");
+        Object rawPickListEventVar = execution.getVariable("pickListEventJson");
+        String pickListEventJson = rawPickListEventVar instanceof byte[]
+                ? new String((byte[]) rawPickListEventVar, java.nio.charset.StandardCharsets.UTF_8)
+                : (String) rawPickListEventVar;
+
+        PickInstruction pickInstruction = objectMapper.readValue(instructionJson, PickInstruction.class);
+        PickListEvent   pickListEvent   = objectMapper.readValue(pickListEventJson, PickListEvent.class);
+
         if ("pick_transaction".equalsIgnoreCase(aeEventType)) {
-            String instructionJson  = (String) execution.getVariable("instructionJson");
-            Object rawPickListEventVar = execution.getVariable("pickListEventJson");
-            String pickListEventJson = rawPickListEventVar instanceof byte[]
-                    ? new String((byte[]) rawPickListEventVar, java.nio.charset.StandardCharsets.UTF_8)
-                    : (String) rawPickListEventVar;
-
-            PickInstruction pickInstruction = objectMapper.readValue(instructionJson, PickInstruction.class);
-            PickListEvent   pickListEvent   = objectMapper.readValue(pickListEventJson, PickListEvent.class);
-
             // Pre-checks all txIds; rejects entire event if any duplicate found.
-            // Returns false → BPMN loops back to waitForTransactionUpdate via default UPDATE path.
-            boolean processed = pickInstructionService.processPickTransaction(pickInstructionId, pickListEvent, pickInstruction);
-            if (!processed) {
+            ProcessResult result = pickInstructionService.processPickTransaction(pickInstructionId, pickListEvent, pickInstruction);
+            if (!result.processed()) {
                 log.info("pick_transaction rejected (duplicate txId) for pickInstructionId: {} — " +
                          "looping back to waitForTransactionUpdate", pickInstructionId);
+            } else if ("released".equals(result.orderStatus())) {
+                log.info("pick_transaction resulted in released status for pickInstructionId: {} — triggering workflow completion", pickInstructionId);
+                execution.setVariable("command", "COMPLETE");
             }
         }
+
+        // Publish OrderUpdateEvent to order_update.events for both update and pick_transaction events
+        pickInstructionService.enqueueOrderUpdate(pickInstructionId, pickInstruction, pickListEvent);
 
         // txStatus drives txFailedGateway: SUCCESS = normal path, FAILED = terminal failure path
         execution.setVariable("txStatus", "SUCCESS");
