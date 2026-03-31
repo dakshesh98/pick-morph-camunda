@@ -16,7 +16,7 @@ Tests the full pick instruction workflow using **production-like Kellanova paylo
 |-------|-------|--------|
 | `pickInstructionId` | `Kellanova_order999977132` | Root `externalServiceRequestId` in AE order |
 | `orderlineId` | `Kellanova_order999977132_1` | serviceRequest `externalServiceRequestId` |
-| `transactionId` | `1772445745488` | `transactions[].transactionId` in pick_transaction event |
+| `transactionId` | `1772445745488` (3a-3), `1772445745489` (3a-4), `1772445745490` (3a-6), `1772445745491` (3b), `1772445745492` (4c) | `transactions[].transactionId` — unique per step |
 | `internal_order_id` | `24234242` | `containerAttributes.internal_order_id` |
 | `product_sku` | `10840243112927` | `productAttributes.product_sku` (expectations) |
 | `product_uid` | `867` | `actuals.containers.products[].uid` |
@@ -200,13 +200,14 @@ KAFKA_EOF
 ```bash
 # Logs
 docker logs pick-morph-camunda-spring-camunda-1 --since 10s 2>&1 | \
-  grep -E "Kellanova_order999977132|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent"
+  grep -E "Kellanova_order999977132|ProcessPickListEventDelegate|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent|Duplicate txId"
 # Expected:
 #   "Received pick-list event from AE | pickInstructionId: Kellanova_order999977132 | event_type: update | state: cancellation_locked | sub_state: created"
-#   "AE update event | pickInstructionId: Kellanova_order999977132 | ... | state: cancellation_locked | sub_state: created"
+#   "ItemPickingEventMessage correlated | pickInstructionId: Kellanova_order999977132"
+#   "ProcessPickListEventDelegate executing for pickInstructionId: Kellanova_order999977132"
 #   "Updated ae_order for pickInstructionId: Kellanova_order999977132, state: cancellation_locked"
-#   "ItemPickingEventMessage correlated for update event | pickInstructionId: Kellanova_order999977132 | command: ..."
 #   "Enqueued OrderUpdateEvent | pickInstructionId: Kellanova_order999977132 | orderline: Kellanova_orderline999977123_1 | state: cancellation_locked | sub_state: created"
+#   NOTE: no transactions in this event — no ItemPickedEvent or transaction OrderUpdateEvent
 
 # DB
 docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
@@ -245,13 +246,14 @@ KAFKA_EOF
 ```bash
 # Logs
 docker logs pick-morph-camunda-spring-camunda-1 --since 10s 2>&1 | \
-  grep -E "Kellanova_order999977132|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent"
+  grep -E "Kellanova_order999977132|ProcessPickListEventDelegate|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent|Duplicate txId"
 # Expected:
 #   "Received pick-list event from AE | pickInstructionId: Kellanova_order999977132 | event_type: update | state: cancellation_locked | sub_state: in_palletization"
-#   "AE update event | pickInstructionId: Kellanova_order999977132 | ... | state: cancellation_locked | sub_state: in_palletization"
+#   "ItemPickingEventMessage correlated | pickInstructionId: Kellanova_order999977132"
+#   "ProcessPickListEventDelegate executing for pickInstructionId: Kellanova_order999977132"
 #   "Updated ae_order for pickInstructionId: Kellanova_order999977132, state: cancellation_locked"
-#   "ItemPickingEventMessage correlated for update event | pickInstructionId: Kellanova_order999977132 | command: ..."
 #   "Enqueued OrderUpdateEvent | pickInstructionId: Kellanova_order999977132 | orderline: Kellanova_orderline999977123_1 | state: cancellation_locked | sub_state: in_palletization"
+#   NOTE: no transactions in this event — no ItemPickedEvent or transaction OrderUpdateEvent
 
 # DB
 docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
@@ -313,12 +315,14 @@ KAFKA_EOF
 ```bash
 # Logs
 docker logs pick-morph-camunda-spring-camunda-1 --since 10s 2>&1 | \
-  grep -E "Kellanova_order999977132|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent"
+  grep -E "Kellanova_order999977132|ProcessPickListEventDelegate|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent|Duplicate txId"
 # Expected:
 #   "Received pick-list event from AE | pickInstructionId: Kellanova_order999977132 | event_type: update | state: cancellation_locked | sub_state: partially_palletized"
-#   "AE update event | pickInstructionId: Kellanova_order999977132 | ... | state: cancellation_locked | sub_state: partially_palletized"
+#   "ItemPickingEventMessage correlated | pickInstructionId: Kellanova_order999977132"
+#   "ProcessPickListEventDelegate executing for pickInstructionId: Kellanova_order999977132"
+#   "Enqueued OrderUpdateEvent (created container) | pickInstructionId: Kellanova_order999977132 | txId: 1772445745488 | orderline: Kellanova_orderline999977123_1"
+#     ↑ txId 1772445745488 first seen here (status=created) — saved to transaction_status
 #   "Updated ae_order for pickInstructionId: Kellanova_order999977132, state: cancellation_locked"
-#   "ItemPickingEventMessage correlated for update event | pickInstructionId: Kellanova_order999977132 | command: ..."
 #   "Enqueued OrderUpdateEvent | pickInstructionId: Kellanova_order999977132 | orderline: Kellanova_orderline999977123_1 | state: cancellation_locked | sub_state: partially_palletized"
 
 # DB
@@ -350,7 +354,7 @@ All orderlines have actuals. `qty_to_be_picked=10`, `qty_picked=0`, `status=crea
 cat << 'KAFKA_EOF' | tr -d '\n' | docker exec -i pick-morph-camunda-kafka-1 \
   /opt/kafka/bin/kafka-console-producer.sh \
   --bootstrap-server localhost:9092 --topic gor.pick-list.events
-{"headers":{"event_type":"update"},"value":{"name":"order_information","payload":{"id":12761,"externalServiceRequestId":"Kellanova_order999977132","serviceRequests":[{"id":12762,"externalServiceRequestId":"Kellanova_orderline999977123_1","serviceRequests":[],"type":"PICK_LINE","actuals":{"containers":[{"transactionId":"1772445745488","containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":0,"status":"created","bot_id":"RIL-L-8305","pps_id":"RIL-L-8305","exceptions":[]}}]},"transactions":[{"transactionId":"1772445745488","containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":0,"status":"created","bot_id":"RIL-L-8305","pps_id":"RIL-L-8305","exceptions":[]}}],"expectations":{"containers":[{"id":27254,"state":"created","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-02-25T12:14:28.282Z","updatedOn":"2026-02-25T12:14:28.282Z","transactionId":null,"products":[{"id":26879,"uid":null,"possibleUids":[{"pdfa_values":["product_sku"],"quantity_per_unit":1,"product_uid":"2102","relative_priority":1,"barcode_map":{"Item":["10840243112927"]}}],"uidType":null,"createdOn":"2026-02-25T12:14:28.283Z","updatedOn":"2026-02-25T12:14:28.283Z","productQuantity":10,"productAttributes":{"filter_parameters":["product_sku = '10840243112927'"],"weight":{"uom":{"id":1,"type":"WEIGHT","unit":"KG","conversionFactor":1},"value":4.264},"description":"client_item","orientation_preference":true,"barcodes":["10840243112927"],"display_name":"10840243112927","tag_strategy":{"tag_name":"expirationDate","direction":"ASC"},"package_count":10,"product_sku":"10840243112927","stacking_sequence":5,"package_parameters":["package_name = 'Item'"],"fragile":false,"tag_parameters":[{"operator":"in","tag_name":"status","tag_value":["EXTN","CRIT","GOOD"]},{"operator":">","tag_name":"expirationDate","tag_value":"2026-02-25T14:14:28Z"}],"dimension":{"uom":{"id":51,"type":"DIMENSION","unit":"CM","conversionFactor":1},"width":22.353,"height":10.414,"length":30.48}}}],"containerAttributes":null,"carrier_type":null,"carrier_sub_type":null}]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.281Z","status":"CREATED","state":"created","attributes":{"sub_state":"fully_palletized","orderType":"GCUS","sr_parentsIds":[12761],"extra_info":{"client_task_id":"Kellanova_order_6b67c109fa1e"},"shelfLifeHours":2,"sr_parent":12761,"has_parent":true,"location":{"displayName":"NB-56-A","fullAddress":"NB-56-A-Zone2","addressFields":{"bay":"56","side":"R","zone":"Zone2","aisle":"NB","level":"A"}},"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z"},"createdOn":"2026-02-25T12:14:28.281Z","updatedOn":"2026-02-25T12:14:28.281Z","isDeleted":false,"stages":[],"onHold":false}],"type":"PICK","actuals":{"containers":[]},"transactions":[],"expectations":{"containers":[]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.280Z","state":"cancellation_locked","attributes":{"event_type":"update","sub_state":"fully_palletized","cust_identity":"WALMART","order_options":{"bintags":[],"behaviours":["group_by_proximity"],"destination":"DOCK_DOOR2","clubbing_key":"WALMART_Type3_NORTH","cust_identity":"WALMART","palletization":true,"container_type":"Type3","order_clubbing":true,"order_splitting":true,"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true,"destination_group":"NORTH","orderline_clubbing":true,"orderline_splitting":true},"destination":"DOCK_DOOR2","flow_name":"default","has_parent":false,"simple_priority":"normal","allowed_storage_system_types":["rtp"],"pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true},"createdOn":"2026-02-25T12:14:28.280Z","updatedOn":"2026-02-25T12:14:33.036Z","isDeleted":false,"stages":[],"fulfillmentArea":["assist_area"],"onHold":false}}}
+{"headers":{"event_type":"update"},"value":{"name":"order_information","payload":{"id":12761,"externalServiceRequestId":"Kellanova_order999977132","serviceRequests":[{"id":12762,"externalServiceRequestId":"Kellanova_orderline999977123_1","serviceRequests":[],"type":"PICK_LINE","actuals":{"containers":[{"transactionId":"1772445745489","containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":0,"status":"created","bot_id":"RIL-L-8305","pps_id":"RIL-L-8305","exceptions":[]}}]},"transactions":[{"transactionId":"1772445745489","containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":0,"status":"created","bot_id":"RIL-L-8305","pps_id":"RIL-L-8305","exceptions":[]}}],"expectations":{"containers":[{"id":27254,"state":"created","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-02-25T12:14:28.282Z","updatedOn":"2026-02-25T12:14:28.282Z","transactionId":null,"products":[{"id":26879,"uid":null,"possibleUids":[{"pdfa_values":["product_sku"],"quantity_per_unit":1,"product_uid":"2102","relative_priority":1,"barcode_map":{"Item":["10840243112927"]}}],"uidType":null,"createdOn":"2026-02-25T12:14:28.283Z","updatedOn":"2026-02-25T12:14:28.283Z","productQuantity":10,"productAttributes":{"filter_parameters":["product_sku = '10840243112927'"],"weight":{"uom":{"id":1,"type":"WEIGHT","unit":"KG","conversionFactor":1},"value":4.264},"description":"client_item","orientation_preference":true,"barcodes":["10840243112927"],"display_name":"10840243112927","tag_strategy":{"tag_name":"expirationDate","direction":"ASC"},"package_count":10,"product_sku":"10840243112927","stacking_sequence":5,"package_parameters":["package_name = 'Item'"],"fragile":false,"tag_parameters":[{"operator":"in","tag_name":"status","tag_value":["EXTN","CRIT","GOOD"]},{"operator":">","tag_name":"expirationDate","tag_value":"2026-02-25T14:14:28Z"}],"dimension":{"uom":{"id":51,"type":"DIMENSION","unit":"CM","conversionFactor":1},"width":22.353,"height":10.414,"length":30.48}}}],"containerAttributes":null,"carrier_type":null,"carrier_sub_type":null}]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.281Z","status":"CREATED","state":"created","attributes":{"sub_state":"fully_palletized","orderType":"GCUS","sr_parentsIds":[12761],"extra_info":{"client_task_id":"Kellanova_order_6b67c109fa1e"},"shelfLifeHours":2,"sr_parent":12761,"has_parent":true,"location":{"displayName":"NB-56-A","fullAddress":"NB-56-A-Zone2","addressFields":{"bay":"56","side":"R","zone":"Zone2","aisle":"NB","level":"A"}},"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z"},"createdOn":"2026-02-25T12:14:28.281Z","updatedOn":"2026-02-25T12:14:28.281Z","isDeleted":false,"stages":[],"onHold":false}],"type":"PICK","actuals":{"containers":[]},"transactions":[],"expectations":{"containers":[]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.280Z","state":"cancellation_locked","attributes":{"event_type":"update","sub_state":"fully_palletized","cust_identity":"WALMART","order_options":{"bintags":[],"behaviours":["group_by_proximity"],"destination":"DOCK_DOOR2","clubbing_key":"WALMART_Type3_NORTH","cust_identity":"WALMART","palletization":true,"container_type":"Type3","order_clubbing":true,"order_splitting":true,"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true,"destination_group":"NORTH","orderline_clubbing":true,"orderline_splitting":true},"destination":"DOCK_DOOR2","flow_name":"default","has_parent":false,"simple_priority":"normal","allowed_storage_system_types":["rtp"],"pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true},"createdOn":"2026-02-25T12:14:28.280Z","updatedOn":"2026-02-25T12:14:33.036Z","isDeleted":false,"stages":[],"fulfillmentArea":["assist_area"],"onHold":false}}}
 KAFKA_EOF
 ```
 
@@ -358,12 +362,14 @@ KAFKA_EOF
 ```bash
 # Logs
 docker logs pick-morph-camunda-spring-camunda-1 --since 10s 2>&1 | \
-  grep -E "Kellanova_order999977132|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent"
+  grep -E "Kellanova_order999977132|ProcessPickListEventDelegate|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent|Duplicate txId"
 # Expected:
 #   "Received pick-list event from AE | pickInstructionId: Kellanova_order999977132 | event_type: update | state: cancellation_locked | sub_state: fully_palletized"
-#   "AE update event | pickInstructionId: Kellanova_order999977132 | ... | state: cancellation_locked | sub_state: fully_palletized"
+#   "ItemPickingEventMessage correlated | pickInstructionId: Kellanova_order999977132"
+#   "ProcessPickListEventDelegate executing for pickInstructionId: Kellanova_order999977132"
+#   "Enqueued OrderUpdateEvent (created container) | pickInstructionId: Kellanova_order999977132 | txId: 1772445745489 | orderline: Kellanova_orderline999977123_1"
+#     ↑ txId 1772445745489 is new — saved to transaction_status
 #   "Updated ae_order for pickInstructionId: Kellanova_order999977132, state: cancellation_locked"
-#   "ItemPickingEventMessage correlated for update event | pickInstructionId: Kellanova_order999977132 | command: ..."
 #   "Enqueued OrderUpdateEvent | pickInstructionId: Kellanova_order999977132 | orderline: Kellanova_orderline999977123_1 | state: cancellation_locked | sub_state: fully_palletized"
 
 # DB
@@ -403,13 +409,14 @@ KAFKA_EOF
 ```bash
 # Logs
 docker logs pick-morph-camunda-spring-camunda-1 --since 10s 2>&1 | \
-  grep -E "Kellanova_order999977132|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent"
+  grep -E "Kellanova_order999977132|ProcessPickListEventDelegate|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent|Duplicate txId"
 # Expected:
 #   "Received pick-list event from AE | pickInstructionId: Kellanova_order999977132 | event_type: update | state: cancellation_locked | sub_state: INTERNAL_ORDER_CREATED"
-#   "AE update event | pickInstructionId: Kellanova_order999977132 | ... | state: cancellation_locked | sub_state: INTERNAL_ORDER_CREATED"
+#   "ItemPickingEventMessage correlated | pickInstructionId: Kellanova_order999977132"
+#   "ProcessPickListEventDelegate executing for pickInstructionId: Kellanova_order999977132"
 #   "Updated ae_order for pickInstructionId: Kellanova_order999977132, state: cancellation_locked"
-#   "ItemPickingEventMessage correlated for update event | pickInstructionId: Kellanova_order999977132 | command: ..."
 #   "Enqueued OrderUpdateEvent | pickInstructionId: Kellanova_order999977132 | orderline: Kellanova_orderline999977123_1 | state: cancellation_locked | sub_state: INTERNAL_ORDER_CREATED"
+#   NOTE: transactions=[] in this event — no transaction processing
 
 # DB
 docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
@@ -439,7 +446,7 @@ Internal order pallet loaded onto bot. `state=fulfillable`, `status=loaded`, `qt
 cat << 'KAFKA_EOF' | tr -d '\n' | docker exec -i pick-morph-camunda-kafka-1 \
   /opt/kafka/bin/kafka-console-producer.sh \
   --bootstrap-server localhost:9092 --topic gor.pick-list.events
-{"headers":{"event_type":"update"},"value":{"name":"order_information","payload":{"id":12761,"externalServiceRequestId":"Kellanova_order999977132","serviceRequests":[{"id":12762,"externalServiceRequestId":"Kellanova_orderline999977123_1","serviceRequests":[],"type":"PICK_LINE","actuals":{"containers":[{"transactionId":"1772445745488","containerAttributes":{"internal_order_id":"52342","lpn_id":"52342","qty_to_be_picked":10,"qty_picked":0,"status":"loaded","bot_id":"RIL-L-8305","pps_id":"RIL-L-8305","exceptions":[]}}]},"transactions":[{"transactionId":"1772445745488","containerAttributes":{"internal_order_id":"52342","lpn_id":"52342","qty_to_be_picked":10,"qty_picked":0,"status":"loaded","bot_id":"RIL-L-8305","pps_id":"RIL-L-8305","exceptions":[]}}],"expectations":{"containers":[{"id":27254,"state":"created","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-02-25T12:14:28.282Z","updatedOn":"2026-02-25T12:14:28.282Z","transactionId":null,"products":[{"id":26879,"uid":null,"possibleUids":[{"pdfa_values":["product_sku"],"quantity_per_unit":1,"product_uid":"2102","relative_priority":1,"barcode_map":{"Item":["10840243112927"]}}],"uidType":null,"createdOn":"2026-02-25T12:14:28.283Z","updatedOn":"2026-02-25T12:14:28.283Z","productQuantity":10,"productAttributes":{"filter_parameters":["product_sku = '10840243112927'"],"weight":{"uom":{"id":1,"type":"WEIGHT","unit":"KG","conversionFactor":1},"value":4.264},"description":"client_item","orientation_preference":true,"barcodes":["10840243112927"],"display_name":"10840243112927","tag_strategy":{"tag_name":"expirationDate","direction":"ASC"},"package_count":10,"product_sku":"10840243112927","stacking_sequence":5,"package_parameters":["package_name = 'Item'"],"fragile":false,"tag_parameters":[{"operator":"in","tag_name":"status","tag_value":["EXTN","CRIT","GOOD"]},{"operator":">","tag_name":"expirationDate","tag_value":"2026-02-25T14:14:28Z"}],"dimension":{"uom":{"id":51,"type":"DIMENSION","unit":"CM","conversionFactor":1},"width":22.353,"height":10.414,"length":30.48}}}],"containerAttributes":null,"carrier_type":null,"carrier_sub_type":null}]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.281Z","status":"PROCESSING","state":"fulfillable","attributes":{"sub_state":"in_progress","orderType":"GCUS","sr_parentsIds":[12761],"extra_info":{"client_task_id":"Kellanova_order_6b67c109fa1e"},"shelfLifeHours":2,"sr_parent":12761,"has_parent":true,"location":{"displayName":"NB-56-A","fullAddress":"NB-56-A-Zone2","addressFields":{"bay":"56","side":"R","zone":"Zone2","aisle":"NB","level":"A"}},"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z"},"createdOn":"2026-02-25T12:14:28.281Z","updatedOn":"2026-02-25T12:14:28.281Z","isDeleted":false,"stages":[],"onHold":false}],"type":"PICK","actuals":{"containers":[]},"transactions":[],"expectations":{"containers":[]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.280Z","state":"fulfillable","attributes":{"event_type":"update","sub_state":"in_progress","cust_identity":"WALMART","order_options":{"bintags":[],"behaviours":["group_by_proximity"],"destination":"DOCK_DOOR2","clubbing_key":"WALMART_Type3_NORTH","cust_identity":"WALMART","palletization":true,"container_type":"Type3","order_clubbing":true,"order_splitting":true,"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true,"destination_group":"NORTH","orderline_clubbing":true,"orderline_splitting":true},"destination":"DOCK_DOOR2","flow_name":"default","has_parent":false,"simple_priority":"normal","allowed_storage_system_types":["rtp"],"pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true},"createdOn":"2026-02-25T12:14:28.280Z","updatedOn":"2026-02-25T12:14:33.036Z","isDeleted":false,"stages":[],"fulfillmentArea":["assist_area"],"onHold":false}}}
+{"headers":{"event_type":"update"},"value":{"name":"order_information","payload":{"id":12761,"externalServiceRequestId":"Kellanova_order999977132","serviceRequests":[{"id":12762,"externalServiceRequestId":"Kellanova_orderline999977123_1","serviceRequests":[],"type":"PICK_LINE","actuals":{"containers":[{"transactionId":"1772445745490","containerAttributes":{"internal_order_id":"52342","lpn_id":"52342","qty_to_be_picked":10,"qty_picked":0,"status":"loaded","bot_id":"RIL-L-8305","pps_id":"RIL-L-8305","exceptions":[]}}]},"transactions":[{"transactionId":"1772445745490","containerAttributes":{"internal_order_id":"52342","lpn_id":"52342","qty_to_be_picked":10,"qty_picked":0,"status":"loaded","bot_id":"RIL-L-8305","pps_id":"RIL-L-8305","exceptions":[]}}],"expectations":{"containers":[{"id":27254,"state":"created","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-02-25T12:14:28.282Z","updatedOn":"2026-02-25T12:14:28.282Z","transactionId":null,"products":[{"id":26879,"uid":null,"possibleUids":[{"pdfa_values":["product_sku"],"quantity_per_unit":1,"product_uid":"2102","relative_priority":1,"barcode_map":{"Item":["10840243112927"]}}],"uidType":null,"createdOn":"2026-02-25T12:14:28.283Z","updatedOn":"2026-02-25T12:14:28.283Z","productQuantity":10,"productAttributes":{"filter_parameters":["product_sku = '10840243112927'"],"weight":{"uom":{"id":1,"type":"WEIGHT","unit":"KG","conversionFactor":1},"value":4.264},"description":"client_item","orientation_preference":true,"barcodes":["10840243112927"],"display_name":"10840243112927","tag_strategy":{"tag_name":"expirationDate","direction":"ASC"},"package_count":10,"product_sku":"10840243112927","stacking_sequence":5,"package_parameters":["package_name = 'Item'"],"fragile":false,"tag_parameters":[{"operator":"in","tag_name":"status","tag_value":["EXTN","CRIT","GOOD"]},{"operator":">","tag_name":"expirationDate","tag_value":"2026-02-25T14:14:28Z"}],"dimension":{"uom":{"id":51,"type":"DIMENSION","unit":"CM","conversionFactor":1},"width":22.353,"height":10.414,"length":30.48}}}],"containerAttributes":null,"carrier_type":null,"carrier_sub_type":null}]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.281Z","status":"PROCESSING","state":"fulfillable","attributes":{"sub_state":"in_progress","orderType":"GCUS","sr_parentsIds":[12761],"extra_info":{"client_task_id":"Kellanova_order_6b67c109fa1e"},"shelfLifeHours":2,"sr_parent":12761,"has_parent":true,"location":{"displayName":"NB-56-A","fullAddress":"NB-56-A-Zone2","addressFields":{"bay":"56","side":"R","zone":"Zone2","aisle":"NB","level":"A"}},"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z"},"createdOn":"2026-02-25T12:14:28.281Z","updatedOn":"2026-02-25T12:14:28.281Z","isDeleted":false,"stages":[],"onHold":false}],"type":"PICK","actuals":{"containers":[]},"transactions":[],"expectations":{"containers":[]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.280Z","state":"fulfillable","attributes":{"event_type":"update","sub_state":"in_progress","cust_identity":"WALMART","order_options":{"bintags":[],"behaviours":["group_by_proximity"],"destination":"DOCK_DOOR2","clubbing_key":"WALMART_Type3_NORTH","cust_identity":"WALMART","palletization":true,"container_type":"Type3","order_clubbing":true,"order_splitting":true,"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true,"destination_group":"NORTH","orderline_clubbing":true,"orderline_splitting":true},"destination":"DOCK_DOOR2","flow_name":"default","has_parent":false,"simple_priority":"normal","allowed_storage_system_types":["rtp"],"pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true},"createdOn":"2026-02-25T12:14:28.280Z","updatedOn":"2026-02-25T12:14:33.036Z","isDeleted":false,"stages":[],"fulfillmentArea":["assist_area"],"onHold":false}}}
 KAFKA_EOF
 ```
 
@@ -447,12 +454,14 @@ KAFKA_EOF
 ```bash
 # Logs
 docker logs pick-morph-camunda-spring-camunda-1 --since 10s 2>&1 | \
-  grep -E "Kellanova_order999977132|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent"
+  grep -E "Kellanova_order999977132|ProcessPickListEventDelegate|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent|Duplicate txId"
 # Expected:
 #   "Received pick-list event from AE | pickInstructionId: Kellanova_order999977132 | event_type: update | state: fulfillable | sub_state: in_progress"
-#   "AE update event | pickInstructionId: Kellanova_order999977132 | ... | state: fulfillable | sub_state: in_progress"
+#   "ItemPickingEventMessage correlated | pickInstructionId: Kellanova_order999977132"
+#   "ProcessPickListEventDelegate executing for pickInstructionId: Kellanova_order999977132"
+#   "Enqueued ItemPickedEvent | pickInstructionId: Kellanova_order999977132 | txId: 1772445745490 | containerStatus: loaded | danglingArea: bot"
+#     ↑ txId 1772445745490 is new, status=loaded → ItemPickedEvent with danglingArea=bot
 #   "Updated ae_order for pickInstructionId: Kellanova_order999977132, state: fulfillable"
-#   "ItemPickingEventMessage correlated for update event | pickInstructionId: Kellanova_order999977132 | command: ..."
 #   "Enqueued OrderUpdateEvent | pickInstructionId: Kellanova_order999977132 | orderline: Kellanova_orderline999977123_1 | state: fulfillable | sub_state: in_progress"
 
 # DB
@@ -473,14 +482,19 @@ docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
           payload::jsonb->>'transaction_id' AS transaction_id
    FROM outbox_event WHERE topic='gor.order_update.events' ORDER BY created_at DESC LIMIT 1;"
 # Expected: status=PUBLISHED, order_id=O123, orderline_id=O123-OL123, state=fulfillable, sub_state=in_progress, transaction_id=Kellanova_order999977132_52342
+# item_picked.events — ItemPickedEvent published (status=loaded, danglingArea=bot)
+docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
+  "SELECT aggregate_id, topic, status, published_at FROM outbox_event WHERE topic='gor.item_picked.events' ORDER BY created_at DESC LIMIT 1;"
+# Expected: topic=gor.item_picked.events, status=PUBLISHED, aggregate_id=Kellanova_order999977132
 ```
 
 ---
 
 ## Step 3b — Bot Picks Item (pick_transaction event)
 
-**What happens:** AE publishes `pick_transaction`. App saves `transaction_status` (with payload)
-+ outbox event atomically → relay publishes to `gor.item_picked.events`.
+**What happens:** AE publishes `pick_transaction`. Container has `status="complete"` and `txId=1772445745491`.
+`txId=1772445745491` is new — saved to `transaction_status`. However, `status="complete"` is **not in the dispatch switch**
+(`loaded`/`unloaded`/`created`), so **no ItemPickedEvent is enqueued**. `ae_order` is updated; SR-level `OrderUpdateEvent` fires.
 
 **Topic:** `gor.pick-list.events`
 
@@ -488,7 +502,7 @@ docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
 cat << 'KAFKA_EOF' | tr -d '\n' | docker exec -i pick-morph-camunda-kafka-1 \
   /opt/kafka/bin/kafka-console-producer.sh \
   --bootstrap-server localhost:9092 --topic gor.pick-list.events
-{"headers":{"event_type":"pick_transaction"},"value":{"name":"order_information","payload":{"id":12761,"externalServiceRequestId":"Kellanova_order999977132","serviceRequests":[{"id":12762,"externalServiceRequestId":"Kellanova_order999977132_1","serviceRequests":[],"type":"PICK_LINE","actuals":{"containers":[{"id":2389529,"state":"complete","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-03-02T10:02:27.987Z","updatedOn":"2026-03-02T10:02:27.989Z","transactionId":"1772445745488","products":[{"id":2389907,"uid":"867","possibleUids":null,"uidType":null,"createdOn":"2026-03-02T10:02:27.988Z","updatedOn":"2026-03-02T10:02:27.988Z","productQuantity":10,"productAttributes":{"tote_id":"C2554495756DOCK_DOOR204","package_count":10,"pdfa_values":{"product_sku":"10840243142832"},"package_name":"undefined","serialized_content":[],"tote_ids":["C2554495756DOCK_DOOR204"]}}],"containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":10,"status":"complete","tote_id":"C2554495756DOCK_DOOR204","pps_bin_id":"undefined","pps_seat_name":"undefined","trueCopyIdOf":1816456,"user_name":"grey7","rollcage_id":"","pps_id":"RIL-L-8301","destination_location":"","location":"19-038-A","bot_id":"RIL-L-8301","exceptions":[]},"carrier_type":null,"carrier_sub_type":null}]},"transactions":[{"id":2389529,"state":"complete","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-03-02T10:02:27.987Z","updatedOn":"2026-03-02T10:02:27.989Z","transactionId":"1772445745488","products":[{"id":2389907,"uid":"867","possibleUids":null,"uidType":null,"createdOn":"2026-03-02T10:02:27.988Z","updatedOn":"2026-03-02T10:02:27.988Z","productQuantity":10,"productAttributes":{"tote_id":"C2554495756DOCK_DOOR204","package_count":10,"pdfa_values":{"product_sku":"10840243142832"},"package_name":"undefined","serialized_content":[],"tote_ids":["C2554495756DOCK_DOOR204"]}}],"containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":10,"status":"complete","tote_id":"C2554495756DOCK_DOOR204","pps_bin_id":"undefined","pps_seat_name":"undefined","trueCopyIdOf":1816456,"user_name":"grey7","rollcage_id":"","pps_id":"RIL-L-8301","destination_location":"","location":"19-038-A","bot_id":"RIL-L-8301","exceptions":[]},"carrier_type":null,"carrier_sub_type":null}],"expectations":{"containers":[{"id":27254,"state":"created","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-02-25T12:14:28.282Z","updatedOn":"2026-02-25T12:14:28.282Z","transactionId":null,"products":[{"id":26879,"uid":null,"possibleUids":[{"pdfa_values":["product_sku"],"quantity_per_unit":1,"product_uid":"2102","relative_priority":1,"barcode_map":{"Item":["10840243112927"]}}],"uidType":null,"createdOn":"2026-02-25T12:14:28.283Z","updatedOn":"2026-02-25T12:14:28.283Z","productQuantity":10,"productAttributes":{"filter_parameters":["product_sku = '10840243112927'"],"weight":{"uom":{"id":1,"type":"WEIGHT","unit":"KG","conversionFactor":1},"value":4.264},"description":"client_item","orientation_preference":true,"barcodes":["10840243112927"],"display_name":"10840243112927","tag_strategy":{"tag_name":"expirationDate","direction":"ASC"},"package_count":10,"product_sku":"10840243112927","stacking_sequence":5,"package_parameters":["package_name = 'Item'"],"fragile":false,"tag_parameters":[{"operator":"in","tag_name":"status","tag_value":["EXTN","CRIT","GOOD"]},{"operator":">","tag_name":"expirationDate","tag_value":"2026-02-25T14:14:28Z"}],"dimension":{"uom":{"id":51,"type":"DIMENSION","unit":"CM","conversionFactor":1},"width":22.353,"height":10.414,"length":30.48}}}],"containerAttributes":null,"carrier_type":null,"carrier_sub_type":null}]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.281Z","status":"PROCESSED","state":"complete","attributes":{"sub_state":"complete","orderType":"GCUS","sr_parentsIds":[12761],"extra_info":{"client_task_id":"Kellanova_order_6b67c109fa1e"},"shelfLifeHours":2,"sr_parent":12761,"has_parent":true,"location":{"displayName":"NB-56-A","fullAddress":"NB-56-A-Zone2","addressFields":{"bay":"56","side":"R","zone":"Zone2","aisle":"NB","level":"A"}},"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z"},"createdOn":"2026-02-25T12:14:28.281Z","updatedOn":"2026-02-25T12:14:28.281Z","isDeleted":false,"stages":[{"id":11648,"orderId":1816446,"externalServiceRequestId":"Kellanova_order999977132_1","transactionStatus":"PROCESSED","transactionState":"complete","transactionType":"Each Pick","childSR":[1816456],"ordering":1}],"onHold":false}],"type":"PICK","actuals":{"containers":[]},"transactions":[],"expectations":{"containers":[]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.280Z","status":"PROCESSING","state":"pick_transaction","attributes":{"event_type":"pick_transaction","sub_state":"in_progress","cust_identity":"WALMART","order_options":{"bintags":[],"behaviours":["group_by_proximity"],"destination":"DOCK_DOOR2","clubbing_key":"WALMART_Type3_NORTH","cust_identity":"WALMART","palletization":true,"container_type":"Type3","order_clubbing":true,"order_splitting":true,"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true,"destination_group":"NORTH","orderline_clubbing":true,"orderline_splitting":true},"destination":"DOCK_DOOR2","flow_name":"default","has_parent":false,"simple_priority":"normal","allowed_storage_system_types":["rtp"],"pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true},"createdOn":"2026-02-25T12:14:28.280Z","updatedOn":"2026-02-25T12:14:33.036Z","isDeleted":false,"stages":[],"fulfillmentArea":["assist_area"],"onHold":false}}}
+{"headers":{"event_type":"pick_transaction"},"value":{"name":"order_information","payload":{"id":12761,"externalServiceRequestId":"Kellanova_order999977132","serviceRequests":[{"id":12762,"externalServiceRequestId":"Kellanova_order999977132_1","serviceRequests":[],"type":"PICK_LINE","actuals":{"containers":[{"id":2389529,"state":"complete","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-03-02T10:02:27.987Z","updatedOn":"2026-03-02T10:02:27.989Z","transactionId":"1772445745491","products":[{"id":2389907,"uid":"867","possibleUids":null,"uidType":null,"createdOn":"2026-03-02T10:02:27.988Z","updatedOn":"2026-03-02T10:02:27.988Z","productQuantity":10,"productAttributes":{"tote_id":"C2554495756DOCK_DOOR204","package_count":10,"pdfa_values":{"product_sku":"10840243142832"},"package_name":"undefined","serialized_content":[],"tote_ids":["C2554495756DOCK_DOOR204"]}}],"containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":10,"status":"complete","tote_id":"C2554495756DOCK_DOOR204","pps_bin_id":"undefined","pps_seat_name":"undefined","trueCopyIdOf":1816456,"user_name":"grey7","rollcage_id":"","pps_id":"RIL-L-8301","destination_location":"","location":"19-038-A","bot_id":"RIL-L-8301","exceptions":[]},"carrier_type":null,"carrier_sub_type":null}]},"transactions":[{"id":2389529,"state":"complete","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-03-02T10:02:27.987Z","updatedOn":"2026-03-02T10:02:27.989Z","transactionId":"1772445745491","products":[{"id":2389907,"uid":"867","possibleUids":null,"uidType":null,"createdOn":"2026-03-02T10:02:27.988Z","updatedOn":"2026-03-02T10:02:27.988Z","productQuantity":10,"productAttributes":{"tote_id":"C2554495756DOCK_DOOR204","package_count":10,"pdfa_values":{"product_sku":"10840243142832"},"package_name":"undefined","serialized_content":[],"tote_ids":["C2554495756DOCK_DOOR204"]}}],"containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":10,"status":"complete","tote_id":"C2554495756DOCK_DOOR204","pps_bin_id":"undefined","pps_seat_name":"undefined","trueCopyIdOf":1816456,"user_name":"grey7","rollcage_id":"","pps_id":"RIL-L-8301","destination_location":"","location":"19-038-A","bot_id":"RIL-L-8301","exceptions":[]},"carrier_type":null,"carrier_sub_type":null}],"expectations":{"containers":[{"id":27254,"state":"created","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-02-25T12:14:28.282Z","updatedOn":"2026-02-25T12:14:28.282Z","transactionId":null,"products":[{"id":26879,"uid":null,"possibleUids":[{"pdfa_values":["product_sku"],"quantity_per_unit":1,"product_uid":"2102","relative_priority":1,"barcode_map":{"Item":["10840243112927"]}}],"uidType":null,"createdOn":"2026-02-25T12:14:28.283Z","updatedOn":"2026-02-25T12:14:28.283Z","productQuantity":10,"productAttributes":{"filter_parameters":["product_sku = '10840243112927'"],"weight":{"uom":{"id":1,"type":"WEIGHT","unit":"KG","conversionFactor":1},"value":4.264},"description":"client_item","orientation_preference":true,"barcodes":["10840243112927"],"display_name":"10840243112927","tag_strategy":{"tag_name":"expirationDate","direction":"ASC"},"package_count":10,"product_sku":"10840243112927","stacking_sequence":5,"package_parameters":["package_name = 'Item'"],"fragile":false,"tag_parameters":[{"operator":"in","tag_name":"status","tag_value":["EXTN","CRIT","GOOD"]},{"operator":">","tag_name":"expirationDate","tag_value":"2026-02-25T14:14:28Z"}],"dimension":{"uom":{"id":51,"type":"DIMENSION","unit":"CM","conversionFactor":1},"width":22.353,"height":10.414,"length":30.48}}}],"containerAttributes":null,"carrier_type":null,"carrier_sub_type":null}]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.281Z","status":"PROCESSED","state":"complete","attributes":{"sub_state":"complete","orderType":"GCUS","sr_parentsIds":[12761],"extra_info":{"client_task_id":"Kellanova_order_6b67c109fa1e"},"shelfLifeHours":2,"sr_parent":12761,"has_parent":true,"location":{"displayName":"NB-56-A","fullAddress":"NB-56-A-Zone2","addressFields":{"bay":"56","side":"R","zone":"Zone2","aisle":"NB","level":"A"}},"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z"},"createdOn":"2026-02-25T12:14:28.281Z","updatedOn":"2026-02-25T12:14:28.281Z","isDeleted":false,"stages":[{"id":11648,"orderId":1816446,"externalServiceRequestId":"Kellanova_order999977132_1","transactionStatus":"PROCESSED","transactionState":"complete","transactionType":"Each Pick","childSR":[1816456],"ordering":1}],"onHold":false}],"type":"PICK","actuals":{"containers":[]},"transactions":[],"expectations":{"containers":[]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.280Z","status":"PROCESSING","state":"pick_transaction","attributes":{"event_type":"pick_transaction","sub_state":"in_progress","cust_identity":"WALMART","order_options":{"bintags":[],"behaviours":["group_by_proximity"],"destination":"DOCK_DOOR2","clubbing_key":"WALMART_Type3_NORTH","cust_identity":"WALMART","palletization":true,"container_type":"Type3","order_clubbing":true,"order_splitting":true,"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true,"destination_group":"NORTH","orderline_clubbing":true,"orderline_splitting":true},"destination":"DOCK_DOOR2","flow_name":"default","has_parent":false,"simple_priority":"normal","allowed_storage_system_types":["rtp"],"pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true},"createdOn":"2026-02-25T12:14:28.280Z","updatedOn":"2026-02-25T12:14:33.036Z","isDeleted":false,"stages":[],"fulfillmentArea":["assist_area"],"onHold":false}}}
 KAFKA_EOF
 ```
 
@@ -497,17 +511,14 @@ KAFKA_EOF
 ```bash
 # Logs
 docker logs pick-morph-camunda-spring-camunda-1 --since 10s 2>&1 | \
-  grep -E "Kellanova_order999977132|pick_transaction|validatePersistAndEnqueue|Enqueued ItemPickedEvent|Enqueued OrderUpdateEvent|Outbox PUBLISHED"
+  grep -E "Kellanova_order999977132|ProcessPickListEventDelegate|Updated ae_order|ItemPickingEventMessage|Enqueued ItemPickedEvent|Enqueued OrderUpdateEvent|Duplicate txId"
 # Expected:
 #   "Received pick-list event from AE | pickInstructionId: Kellanova_order999977132 | event_type: pick_transaction | state: pick_transaction | sub_state: in_progress"
-#   "pick_transaction event | pickInstructionId: Kellanova_order999977132"
-#   "SendItemPickedEventDelegate executing for pickInstructionId: Kellanova_order999977132, aeEventType: pick_transaction"
-#   "validatePersistAndEnqueue — pickInstructionId: Kellanova_order999977132, txId: 1772445745488"
+#   "ItemPickingEventMessage correlated | pickInstructionId: Kellanova_order999977132"
+#   "ProcessPickListEventDelegate executing for pickInstructionId: Kellanova_order999977132"
 #   "Updated ae_order for pickInstructionId: Kellanova_order999977132, state: pick_transaction"
-#   "Enqueued ItemPickedEvent to outbox for pickInstructionId: Kellanova_order999977132, txId: 1772445745488"
-#   "ItemPickingEventMessage correlated for pick_transaction | pickInstructionId: Kellanova_order999977132"
 #   "Enqueued OrderUpdateEvent | pickInstructionId: Kellanova_order999977132 | orderline: Kellanova_order999977132_1 | state: pick_transaction | sub_state: in_progress"
-#   "Outbox PUBLISHED: id=... topic=gor.item_picked.events aggregateId=Kellanova_order999977132"
+# NOTE: No "Enqueued ItemPickedEvent" — container status="complete" has no dispatch rule (not loaded/unloaded/created).
 ```
 
 ```bash
@@ -520,8 +531,9 @@ docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
           payload::jsonb->'containerAttributes'->>'bot_id' AS bot_id,
           payload::jsonb->'containerAttributes'->>'status' AS container_status
    FROM transaction_status;"
-# Expected: transaction_id=1772445745488, status=SUCCESS, qty_picked=10, internal_order_id=24234242
-# Note: transaction_id here is AE's txId; order_update/item_picked events use pick_instruction_id + internal_order_id
+# Expected: transaction_id=1772445745491, status=SUCCESS, qty_picked=10, internal_order_id=24234242
+# Note: txId=1772445745491 is new — a row IS inserted here.
+          No ItemPickedEvent because status="complete" has no dispatch rule.
 
 # 2. ae_order updated — actuals, expectations and state/sub_state set
 docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
@@ -536,12 +548,7 @@ docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
    FROM ae_order WHERE external_service_request_id='Kellanova_order999977132';"
 # Expected: state=pick_transaction, sr_state=complete, actual_tx_id=1772445745488, qty_picked=10, exp_sku=10840243112927
 
-# 3. outbox_event PUBLISHED for item_picked.events
-docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
-  "SELECT aggregate_id, topic, status, published_at FROM outbox_event ORDER BY created_at DESC LIMIT 5;"
-# Expected: topic=gor.item_picked.events, status=PUBLISHED
-
-# 4. order_update.events — OrderUpdateEvent published (pick_transaction)
+# 3. order_update.events — OrderUpdateEvent published (pick_transaction)
 docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
   "SELECT topic, status,
           payload::jsonb->>'order_id' AS order_id,
@@ -554,44 +561,9 @@ docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
 # Expected: status=PUBLISHED, order_id=O123, orderline_id=O123-OL123, state=pick_transaction, sub_state=in_progress, qty_picked=10, transaction_id=Kellanova_order999977132_24234242
 ```
 
-**Read `gor.item_picked.events` from Kafka:**
-
-```bash
-docker exec pick-morph-camunda-kafka-1 \
-  /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic gor.item_picked.events \
-  --from-beginning --max-messages 1 --timeout-ms 5000 2>/dev/null | python3 -m json.tool
-```
-
-**Expected `gor.item_picked.events` payload:**
-
-```json
-{
-  "pps_id": "8301",
-  "seat_name": "seat_1",
-  "order_id": "Kellanova_order999977132",
-  "slot_ref": "R002.1.3.2",
-  "pps_bin_id": "pps_bin_001",
-  "transaction_id": "Kellanova_order999977132_24234242",
-  "state": "complete",
-  "pps_point": "PPS-POINT-1",
-  "user_logged_in": "grey7",
-  "dangling_area": "bot",
-  "is_marked_container_flow": false,
-  "last_item_picked": false,
-  "picked_item_info_list": [
-    {
-      "tpid": "2102",
-      "item_uid": "10840243112927",
-      "uom": "Item",
-      "picked_qty": 10,
-      "pick_instruction_ids": ["Kellanova_order999977132"]
-    }
-  ]
-}
-```
-
-> `dangling_area = "bot"` is set automatically for all `pick_transaction` events (bot pick flow).
+> **No `gor.item_picked.events` in this step** — txId `1772445745488` is deduped (first seen in Step 3a-3).
+> `ItemPickedEvent` fires only when a **new** txId with container `status=loaded` (`danglingArea="bot"`)
+> or `status=unloaded` (`danglingArea=null`) is processed for the first time.
 
 ---
 
@@ -612,40 +584,36 @@ KAFKA_EOF
 **Verify:**
 
 ```bash
-# 1. Logs — update correlated, workflow finalizing and complete
+# 1. Logs — update correlated, ae_order state updated
+# NOTE: containers still have status="complete" (not "unloaded") → AEOrderTransformer computes ol_status=complete, NOT released
+# → command=UPDATE (not COMPLETE) → workflow does NOT end here. Run Step 4c to trigger workflow completion.
 docker logs pick-morph-camunda-spring-camunda-1 --since 10s 2>&1 | \
-  grep -E "Kellanova_order999977132|Updated ae_order|ItemPickingEventMessage|COMPLETE|OnWorkflowComplete|Workflow"
+  grep -E "Kellanova_order999977132|ProcessPickListEventDelegate|Updated ae_order|ItemPickingEventMessage|Enqueued OrderUpdateEvent"
 # Expected:
 #   "Received pick-list event from AE | pickInstructionId: Kellanova_order999977132 | event_type: update | state: complete | sub_state: complete"
-#   "AE update event | pickInstructionId: Kellanova_order999977132 | command: COMPLETE | state: complete | sub_state: complete"
+#   "ItemPickingEventMessage correlated | pickInstructionId: Kellanova_order999977132"
+#   "ProcessPickListEventDelegate executing for pickInstructionId: Kellanova_order999977132"
 #   "Updated ae_order for pickInstructionId: Kellanova_order999977132, state: complete"
-#   "ItemPickingEventMessage correlated for update event | pickInstructionId: Kellanova_order999977132 | command: COMPLETE"
-#   "MarkPickInstructionCompleteDelegate executing for pickInstructionId: Kellanova_order999977132"
-#   "Finalizing Workflow: Pick Instruction Kellanova_order999977132 is COMPLETE."
-#   "OnWorkflowCompleteDelegate executing for pickInstructionId: Kellanova_order999977132, finalStatus: COMPLETED"
-#   "Workflow completing for pickInstructionId: Kellanova_order999977132 — running cleanup and validation."
-#   "Workflow cleanup complete for pickInstructionId: Kellanova_order999977132 — final status: COMPLETED"
+#   "Enqueued OrderUpdateEvent | pickInstructionId: Kellanova_order999977132 | orderline: Kellanova_order999977132_1 | state: complete | sub_state: complete"
+#   NOTE: transactions=[] — no transaction processing; no ItemPickedEvent
 
-# 2. ae_order final state — complete
+# 2. ae_order state — complete (workflow still running, waiting for unload in Step 4c)
 docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
   "SELECT payload::jsonb->>'state' AS state,
           payload::jsonb->'attributes'->>'sub_state' AS sub_state,
           payload::jsonb->'serviceRequests'->0->>'state' AS sr_state,
           payload::jsonb->'serviceRequests'->0->>'status' AS sr_status,
+          payload::jsonb->>'status' AS order_status,
           updated_at
    FROM ae_order WHERE external_service_request_id='Kellanova_order999977132';"
 # Expected: state=complete, sub_state=complete, sr_state=complete, sr_status=PROCESSED
+# order_status should be "complete" (not yet "released" — containers not unloaded yet)
 
-# 3. Camunda process instance ended
+# 3. Camunda process instance still running
 docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
   "SELECT proc_inst_id_, business_key_, start_time_, end_time_
    FROM act_hi_procinst WHERE business_key_='Kellanova_order999977132';"
-# Expected: end_time_ is NOT null (process completed)
-
-# 4. All outbox events published (no PENDING remaining)
-docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
-  "SELECT topic, status, count(*) FROM outbox_event GROUP BY topic, status ORDER BY topic;"
-# Expected: all rows have status=PUBLISHED
+# Expected: end_time_ IS null (workflow still waiting for unload event)
 ```
 
 ---
@@ -668,7 +636,7 @@ docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
 cat << 'KAFKA_EOF' | tr -d '\n' | docker exec -i pick-morph-camunda-kafka-1 \
   /opt/kafka/bin/kafka-console-producer.sh \
   --bootstrap-server localhost:9092 --topic gor.pick-list.events
-{"headers":{"event_type":"update"},"value":{"name":"order_information","payload":{"id":12761,"externalServiceRequestId":"Kellanova_order999977132","serviceRequests":[{"id":12762,"externalServiceRequestId":"Kellanova_order999977132_1","serviceRequests":[],"type":"PICK_LINE","actuals":{"containers":[{"id":2389529,"state":"complete","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-03-02T10:02:27.987Z","updatedOn":"2026-03-02T10:02:27.989Z","transactionId":"1772445745488","products":[{"id":2389907,"uid":"867","possibleUids":null,"uidType":null,"createdOn":"2026-03-02T10:02:27.988Z","updatedOn":"2026-03-02T10:02:27.988Z","productQuantity":10,"productAttributes":{"tote_id":"C2554495756DOCK_DOOR204","package_count":10,"pdfa_values":{"product_sku":"10840243142832"},"package_name":"undefined","serialized_content":[],"tote_ids":["C2554495756DOCK_DOOR204"]}}],"containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":10,"status":"unloaded","tote_id":"C2554495756DOCK_DOOR204","pps_bin_id":"undefined","pps_seat_name":"undefined","trueCopyIdOf":1816456,"user_name":"grey7","rollcage_id":"","pps_id":"RIL-L-8301","destination_location":"","location":"19-038-A","bot_id":"RIL-L-8301","exceptions":[]},"carrier_type":null,"carrier_sub_type":null}]},"transactions":[{"id":2389529,"state":"complete","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-03-02T10:02:27.987Z","updatedOn":"2026-03-02T10:02:27.989Z","transactionId":"1772445745488","products":[{"id":2389907,"uid":"867","possibleUids":null,"uidType":null,"createdOn":"2026-03-02T10:02:27.988Z","updatedOn":"2026-03-02T10:02:27.988Z","productQuantity":10,"productAttributes":{"tote_id":"C2554495756DOCK_DOOR204","package_count":10,"pdfa_values":{"product_sku":"10840243142832"},"package_name":"undefined","serialized_content":[],"tote_ids":["C2554495756DOCK_DOOR204"]}}],"containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":10,"status":"unloaded","tote_id":"C2554495756DOCK_DOOR204","pps_bin_id":"undefined","pps_seat_name":"undefined","trueCopyIdOf":1816456,"user_name":"grey7","rollcage_id":"","pps_id":"RIL-L-8301","destination_location":"","location":"19-038-A","bot_id":"RIL-L-8301","exceptions":[]},"carrier_type":null,"carrier_sub_type":null}],"expectations":{"containers":[{"id":27254,"state":"created","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-02-25T12:14:28.282Z","updatedOn":"2026-02-25T12:14:28.282Z","transactionId":null,"products":[{"id":26879,"uid":null,"possibleUids":[{"pdfa_values":["product_sku"],"quantity_per_unit":1,"product_uid":"2102","relative_priority":1,"barcode_map":{"Item":["10840243112927"]}}],"uidType":null,"createdOn":"2026-02-25T12:14:28.283Z","updatedOn":"2026-02-25T12:14:28.283Z","productQuantity":10,"productAttributes":{"filter_parameters":["product_sku = '10840243112927'"],"weight":{"uom":{"id":1,"type":"WEIGHT","unit":"KG","conversionFactor":1},"value":4.264},"description":"client_item","orientation_preference":true,"barcodes":["10840243112927"],"display_name":"10840243112927","tag_strategy":{"tag_name":"expirationDate","direction":"ASC"},"package_count":10,"product_sku":"10840243112927","stacking_sequence":5,"package_parameters":["package_name = 'Item'"],"fragile":false,"tag_parameters":[{"operator":"in","tag_name":"status","tag_value":["EXTN","CRIT","GOOD"]},{"operator":">","tag_name":"expirationDate","tag_value":"2026-02-25T14:14:28Z"}],"dimension":{"uom":{"id":51,"type":"DIMENSION","unit":"CM","conversionFactor":1},"width":22.353,"height":10.414,"length":30.48}}}],"containerAttributes":null,"carrier_type":null,"carrier_sub_type":null}]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.281Z","status":"PROCESSED","state":"complete","attributes":{"sub_state":"complete","orderType":"GCUS","sr_parentsIds":[12761],"extra_info":{"client_task_id":"Kellanova_order_6b67c109fa1e"},"shelfLifeHours":2,"sr_parent":12761,"has_parent":true,"location":{"displayName":"NB-56-A","fullAddress":"NB-56-A-Zone2","addressFields":{"bay":"56","side":"R","zone":"Zone2","aisle":"NB","level":"A"}},"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z"},"createdOn":"2026-02-25T12:14:28.281Z","updatedOn":"2026-02-25T12:14:28.281Z","isDeleted":false,"stages":[{"id":11648,"orderId":1816446,"externalServiceRequestId":"Kellanova_order999977132_1","transactionStatus":"PROCESSED","transactionState":"complete","transactionType":"Each Pick","childSR":[1816456],"ordering":1}],"onHold":false}],"type":"PICK","actuals":{"containers":[]},"transactions":[],"expectations":{"containers":[]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.280Z","status":"PROCESSED","state":"complete","attributes":{"event_type":"update","sub_state":"complete","cust_identity":"WALMART","order_options":{"bintags":[],"behaviours":["group_by_proximity"],"destination":"DOCK_DOOR2","clubbing_key":"WALMART_Type3_NORTH","cust_identity":"WALMART","palletization":true,"container_type":"Type3","order_clubbing":true,"order_splitting":true,"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true,"destination_group":"NORTH","orderline_clubbing":true,"orderline_splitting":true},"destination":"DOCK_DOOR2","flow_name":"default","has_parent":false,"simple_priority":"normal","allowed_storage_system_types":["rtp"],"pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true},"createdOn":"2026-02-25T12:14:28.280Z","updatedOn":"2026-02-25T12:14:33.036Z","isDeleted":false,"stages":[],"fulfillmentArea":["assist_area"],"onHold":false}}}
+{"headers":{"event_type":"update"},"value":{"name":"order_information","payload":{"id":12761,"externalServiceRequestId":"Kellanova_order999977132","serviceRequests":[{"id":12762,"externalServiceRequestId":"Kellanova_order999977132_1","serviceRequests":[],"type":"PICK_LINE","actuals":{"containers":[{"id":2389529,"state":"complete","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-03-02T10:02:27.987Z","updatedOn":"2026-03-02T10:02:27.989Z","transactionId":"1772445745492","products":[{"id":2389907,"uid":"867","possibleUids":null,"uidType":null,"createdOn":"2026-03-02T10:02:27.988Z","updatedOn":"2026-03-02T10:02:27.988Z","productQuantity":10,"productAttributes":{"tote_id":"C2554495756DOCK_DOOR204","package_count":10,"pdfa_values":{"product_sku":"10840243142832"},"package_name":"undefined","serialized_content":[],"tote_ids":["C2554495756DOCK_DOOR204"]}}],"containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":10,"status":"unloaded","tote_id":"C2554495756DOCK_DOOR204","pps_bin_id":"undefined","pps_seat_name":"undefined","trueCopyIdOf":1816456,"user_name":"grey7","rollcage_id":"","pps_id":"RIL-L-8301","destination_location":"","location":"19-038-A","bot_id":"RIL-L-8301","exceptions":[]},"carrier_type":null,"carrier_sub_type":null}]},"transactions":[{"id":2389529,"state":"complete","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-03-02T10:02:27.987Z","updatedOn":"2026-03-02T10:02:27.989Z","transactionId":"1772445745492","products":[{"id":2389907,"uid":"867","possibleUids":null,"uidType":null,"createdOn":"2026-03-02T10:02:27.988Z","updatedOn":"2026-03-02T10:02:27.988Z","productQuantity":10,"productAttributes":{"tote_id":"C2554495756DOCK_DOOR204","package_count":10,"pdfa_values":{"product_sku":"10840243142832"},"package_name":"undefined","serialized_content":[],"tote_ids":["C2554495756DOCK_DOOR204"]}}],"containerAttributes":{"internal_order_id":24234242,"lpn_id":24234242,"qty_to_be_picked":10,"qty_picked":10,"status":"unloaded","tote_id":"C2554495756DOCK_DOOR204","pps_bin_id":"undefined","pps_seat_name":"undefined","trueCopyIdOf":1816456,"user_name":"grey7","rollcage_id":"","pps_id":"RIL-L-8301","destination_location":"","location":"19-038-A","bot_id":"RIL-L-8301","exceptions":[]},"carrier_type":null,"carrier_sub_type":null}],"expectations":{"containers":[{"id":27254,"state":"created","type":"VIRTUAL","barcode":null,"containers":[],"actions":[],"createdOn":"2026-02-25T12:14:28.282Z","updatedOn":"2026-02-25T12:14:28.282Z","transactionId":null,"products":[{"id":26879,"uid":null,"possibleUids":[{"pdfa_values":["product_sku"],"quantity_per_unit":1,"product_uid":"2102","relative_priority":1,"barcode_map":{"Item":["10840243112927"]}}],"uidType":null,"createdOn":"2026-02-25T12:14:28.283Z","updatedOn":"2026-02-25T12:14:28.283Z","productQuantity":10,"productAttributes":{"filter_parameters":["product_sku = '10840243112927'"],"weight":{"uom":{"id":1,"type":"WEIGHT","unit":"KG","conversionFactor":1},"value":4.264},"description":"client_item","orientation_preference":true,"barcodes":["10840243112927"],"display_name":"10840243112927","tag_strategy":{"tag_name":"expirationDate","direction":"ASC"},"package_count":10,"product_sku":"10840243112927","stacking_sequence":5,"package_parameters":["package_name = 'Item'"],"fragile":false,"tag_parameters":[{"operator":"in","tag_name":"status","tag_value":["EXTN","CRIT","GOOD"]},{"operator":">","tag_name":"expirationDate","tag_value":"2026-02-25T14:14:28Z"}],"dimension":{"uom":{"id":51,"type":"DIMENSION","unit":"CM","conversionFactor":1},"width":22.353,"height":10.414,"length":30.48}}}],"containerAttributes":null,"carrier_type":null,"carrier_sub_type":null}]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.281Z","status":"PROCESSED","state":"complete","attributes":{"sub_state":"complete","orderType":"GCUS","sr_parentsIds":[12761],"extra_info":{"client_task_id":"Kellanova_order_6b67c109fa1e"},"shelfLifeHours":2,"sr_parent":12761,"has_parent":true,"location":{"displayName":"NB-56-A","fullAddress":"NB-56-A-Zone2","addressFields":{"bay":"56","side":"R","zone":"Zone2","aisle":"NB","level":"A"}},"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z"},"createdOn":"2026-02-25T12:14:28.281Z","updatedOn":"2026-02-25T12:14:28.281Z","isDeleted":false,"stages":[{"id":11648,"orderId":1816446,"externalServiceRequestId":"Kellanova_order999977132_1","transactionStatus":"PROCESSED","transactionState":"complete","transactionType":"Each Pick","childSR":[1816456],"ordering":1}],"onHold":false}],"type":"PICK","actuals":{"containers":[]},"transactions":[],"expectations":{"containers":[]},"exceptions":[],"receivedOn":"2026-02-25T12:14:28.280Z","status":"PROCESSED","state":"complete","attributes":{"event_type":"update","sub_state":"complete","cust_identity":"WALMART","order_options":{"bintags":[],"behaviours":["group_by_proximity"],"destination":"DOCK_DOOR2","clubbing_key":"WALMART_Type3_NORTH","cust_identity":"WALMART","palletization":true,"container_type":"Type3","order_clubbing":true,"order_splitting":true,"simple_priority":"normal","pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true,"destination_group":"NORTH","orderline_clubbing":true,"orderline_splitting":true},"destination":"DOCK_DOOR2","flow_name":"default","has_parent":false,"simple_priority":"normal","allowed_storage_system_types":["rtp"],"pick_before_time":"2026-02-25T22:55:52Z","clubbing_required":true},"createdOn":"2026-02-25T12:14:28.280Z","updatedOn":"2026-02-25T12:14:33.036Z","isDeleted":false,"stages":[],"fulfillmentArea":["assist_area"],"onHold":false}}}
 KAFKA_EOF
 ```
 
@@ -692,13 +660,16 @@ Order: Kellanova_order999977132
 ```bash
 # Logs — unloading correlated, status=released, workflow completing
 docker logs pick-morph-camunda-spring-camunda-1 --since 10s 2>&1 | \
-  grep -E "Kellanova_order999977132|Updated ae_order|released|ItemPickingEventMessage|Enqueued OrderUpdateEvent|Finalizing|OnWorkflowComplete|Workflow"
+  grep -E "Kellanova_order999977132|ProcessPickListEventDelegate|Updated ae_order|released|ItemPickingEventMessage|Enqueued OrderUpdateEvent|Duplicate txId|Finalizing|OnWorkflowComplete|Workflow"
 # Expected:
 #   "Received pick-list event from AE | pickInstructionId: Kellanova_order999977132 | event_type: update | state: complete | sub_state: complete"
-#   "AE update event | pickInstructionId: Kellanova_order999977132 | ... | state: complete | sub_state: complete"
+#   "ItemPickingEventMessage correlated | pickInstructionId: Kellanova_order999977132"
+#   "ProcessPickListEventDelegate executing for pickInstructionId: Kellanova_order999977132"
+#   "Enqueued ItemPickedEvent | pickInstructionId: Kellanova_order999977132 | txId: 1772445745492 | containerStatus: unloaded | danglingArea: null"
+#     ↑ txId 1772445745492 is new, status=unloaded → ItemPickedEvent with danglingArea=null
 #   "Status injected — pickInstructionId: Kellanova_order999977132, orderStatus: released"
 #   "Updated ae_order for pickInstructionId: Kellanova_order999977132, aeState: complete, orderStatus: released"
-#   "ItemPickingEventMessage correlated for update event | pickInstructionId: Kellanova_order999977132 | command: COMPLETE"
+#   "Order released for pickInstructionId: Kellanova_order999977132 — triggering workflow completion"
 #   "Enqueued OrderUpdateEvent | pickInstructionId: Kellanova_order999977132 | orderline: Kellanova_order999977132_1 | state: complete | sub_state: complete"
 #   "MarkPickInstructionCompleteDelegate executing for pickInstructionId: Kellanova_order999977132"
 #   "Finalizing Workflow: Pick Instruction Kellanova_order999977132 is COMPLETE."
@@ -736,7 +707,12 @@ docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
    FROM outbox_event WHERE topic='gor.order_update.events' ORDER BY created_at DESC LIMIT 1;"
 # Expected: status=PUBLISHED, state=complete, sub_state=complete, transaction_id=Kellanova_order999977132_24234242
 
-# 4. All outbox events published (no PENDING remaining)
+# 4. item_picked.events — ItemPickedEvent published (status=unloaded, danglingArea=null)
+docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
+  "SELECT aggregate_id, topic, status, published_at FROM outbox_event WHERE topic='gor.item_picked.events' ORDER BY created_at DESC LIMIT 1;"
+# Expected: topic=gor.item_picked.events, status=PUBLISHED, aggregate_id=Kellanova_order999977132
+
+# 5. All outbox events published (no PENDING remaining)
 docker exec pick-morph-camunda-postgres-1 psql -U appuser -d app_db -c \
   "SELECT topic, status, count(*) FROM outbox_event GROUP BY topic, status ORDER BY topic;"
 # Expected: all rows have status=PUBLISHED
@@ -832,6 +808,6 @@ curl -s http://localhost:9191/actuator/health | jq .
 | `gor.pick-instruction.events` | Inbound (Orchestrator → AA) | Step 1 — trigger workflow via Kafka |
 | `gor.pick-list.requests` | Outbound (AA → AE) | Step 1 — workflow start |
 | `gor.pick-list.response` | Inbound (AE → AA) | Step 2 — AE accepts/rejects |
-| `gor.pick-list.events` | Inbound (AE → AA) | Steps 3a, 3b, 4c — update, pick_transaction, unloading |
-| `gor.item_picked.events` | Outbound (AA → Butler Core) | Step 3b — per pick_transaction |
-| `gor.order_update.events` | Outbound (AA → Butler Core) | Steps 3a, 3b & 4c — every update, pick_transaction + unloading |
+| `gor.pick-list.events` | Inbound (AE → AA) | Steps 3a, 3b, 4, 4c — all pick-list events (any event_type) |
+| `gor.item_picked.events` | Outbound (AA → Butler Core) | When a **new** txId with container `status=loaded` or `status=unloaded` is processed (not deduped) |
+| `gor.order_update.events` | Outbound (AA → Butler Core) | Every pick-list event: SR-level update + per-transaction (created container) |

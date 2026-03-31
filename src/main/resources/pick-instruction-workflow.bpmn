@@ -73,10 +73,10 @@
       <messageEventDefinition id="MsgDef_txUpdate" messageRef="Message_ItemPickingEvent"/>
     </intermediateCatchEvent>
 
-    <!-- ─── Send Transaction Kafka Event ─── -->
+    <!-- ─── Process Pick-List Event ─── -->
     <serviceTask id="sendTransactionKafkaTask"
-                 name="Send Transaction Kafka Event"
-                 camunda:delegateExpression="${sendItemPickedEventDelegate}">
+                 name="Process Pick-List Event"
+                 camunda:delegateExpression="${processPickListEventDelegate}">
       <incoming>flow_waitTx_to_sendTxKafka</incoming>
       <outgoing>flow_sendTxKafka_to_commandGw</outgoing>
     </serviceTask>
