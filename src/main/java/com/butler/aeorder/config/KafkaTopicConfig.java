@@ -30,27 +30,42 @@ public class KafkaTopicConfig {
     @Value("${kafka.topic.pick-instructions}")
     private String pickInstructionsTopic;
 
+    @Value("${kafka.topics.pick-instructions-request}")
+    private String pickInstructionsRequestTopic;
+
+    @Value("${kafka.topics.pick-instruction-response}")
+    private String pickInstructionResponseTopic;
+
+    @Value("${kafka.topics.workflow-complete-events}")
+    private String workflowCompleteEventsTopic;
+
     @Bean
     public NewTopic pickListRequestsTopic() {
-        return TopicBuilder.name(pickListRequestsTopic)
-                .partitions(1)
-                .replicas(1)
-                .build();
+        return TopicBuilder.name(pickListRequestsTopic).partitions(1).replicas(1).build();
     }
 
     @Bean
     public NewTopic itemPickedEventsTopic() {
-        return TopicBuilder.name(itemPickedEventsTopic)
-                .partitions(1)
-                .replicas(1)
-                .build();
+        return TopicBuilder.name(itemPickedEventsTopic).partitions(1).replicas(1).build();
     }
 
     @Bean
     public NewTopic pickInstructionsTopic() {
-        return TopicBuilder.name(pickInstructionsTopic)
-                .partitions(1)
-                .replicas(1)
-                .build();
+        return TopicBuilder.name(pickInstructionsTopic).partitions(1).replicas(1).build();
+    }
+
+    @Bean
+    public NewTopic pickInstructionsRequestTopicBean() {
+        return TopicBuilder.name(pickInstructionsRequestTopic).partitions(1).replicas(1).build();
+    }
+
+    @Bean
+    public NewTopic pickInstructionResponseTopicBean() {
+        return TopicBuilder.name(pickInstructionResponseTopic).partitions(1).replicas(1).build();
+    }
+
+    @Bean
+    public NewTopic workflowCompleteEventsTopicBean() {
+        return TopicBuilder.name(workflowCompleteEventsTopic).partitions(1).replicas(1).build();
     }
 }

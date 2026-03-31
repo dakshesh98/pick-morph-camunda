@@ -1,5 +1,6 @@
 package com.butler.aeorder.dto.ae;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -10,9 +11,9 @@ import java.util.List;
 
 /**
  * AE contract DTO for <tenant>.pick-list.events topic.
- * Consumed by AA (this service) to track pick state transitions from AE.
+ * Flat envelope format (same pattern as PickListResponseEvent).
  *
- * Two event_type values (in headers):
+ * Two event_type values (in context.event_type):
  *   - "update"           — order state / data changed
  *   - "pick_transaction" — an item was physically picked on bot
  */
@@ -20,40 +21,44 @@ import java.util.List;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class PickListEvent {
 
-    /** Kafka message headers — contains event_type. */
-    @JsonProperty("headers")
-    private Headers headers;
+    @JsonProperty("source_service")
+    private String sourceService;
 
-    @JsonProperty("value")
-    private Value value;
+    @JsonProperty("timestamp")
+    private String timestamp;
 
-    // ── Headers ─────────────────────────────────────────────────────────────
+    @JsonProperty("message_id")
+    private String messageId;
+
+    @JsonProperty("entity_id")
+    private String entityId;
+
+    @JsonProperty("name")
+    private String name;
+
+    @JsonProperty("payload")
+    private Payload payload;
+
+    @JsonProperty("context")
+    private Context context;
+
+    // ── Context ──────────────────────────────────────────────────────────────
 
     @Data
     @Builder
     @NoArgsConstructor
     @AllArgsConstructor
-    public static class Headers {
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Context {
+
+        @JsonProperty("execution_id")
+        private String executionId;
 
         @JsonProperty("event_type")
         private String eventType;
-    }
-
-    // ── Envelope value ──────────────────────────────────────────────────────
-
-    @Data
-    @Builder
-    @NoArgsConstructor
-    @AllArgsConstructor
-    public static class Value {
-
-        @JsonProperty("name")
-        private String name;
-
-        @JsonProperty("payload")
-        private Payload payload;
     }
 
     // ── Payload (Order) ─────────────────────────────────────────────────────

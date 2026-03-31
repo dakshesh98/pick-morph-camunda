@@ -27,7 +27,7 @@
     <!-- ─── Publish Order to Kafka ─── -->
     <serviceTask id="publishOrderTask"
                  name="Publish Order to Kafka"
-                 camunda:delegateExpression="${sendPickListToAEDelegate}">
+                 camunda:delegateExpression="${publishOrderToKafkaDelegate}">
       <incoming>flow_start_to_publishOrder</incoming>
       <outgoing>flow_publishOrder_to_waitValidation</outgoing>
     </serviceTask>
@@ -40,16 +40,16 @@
     </intermediateCatchEvent>
 
     <!-- ─── Validation Gateway ─── -->
-    <exclusiveGateway id="validationGateway" name="Validation OK?" default="flow_validationGw_to_waitTx">
+    <exclusiveGateway id="validationGateway" name="Validation OK?" default="flow_validationGw_to_publishResponse">
       <incoming>flow_waitValidation_to_validationGw</incoming>
       <outgoing>flow_validationGw_failed</outgoing>
-      <outgoing>flow_validationGw_to_waitTx</outgoing>
+      <outgoing>flow_validationGw_to_publishResponse</outgoing>
     </exclusiveGateway>
 
-    <!-- ─── [FAIL PATH] Set status FAILED for validation failure ─── -->
+    <!-- ─── [FAIL PATH] Handle validation failure atomically ─── -->
     <serviceTask id="markFailedValidation"
-                 name="Mark Failed (Validation)"
-                 camunda:delegateExpression="${markPickInstructionFailedDelegate}">
+                 name="Handle Validation Failure"
+                 camunda:delegateExpression="${handleValidationFailureDelegate}">
       <incoming>flow_validationGw_failed</incoming>
       <outgoing>flow_markFailedValidation_to_onComplete</outgoing>
     </serviceTask>
@@ -65,10 +65,18 @@
       <incoming>flow_onCompleteValidFail_to_end</incoming>
     </endEvent>
 
+    <!-- ─── [SUCCESS PATH] Publish pick-instruction.response to butler_server ─── -->
+    <serviceTask id="publishResponseTask"
+                 name="Publish Pick Instruction Response"
+                 camunda:delegateExpression="${publishPickInstructionResponseDelegate}">
+      <incoming>flow_validationGw_to_publishResponse</incoming>
+      <outgoing>flow_publishResponse_to_waitTx</outgoing>
+    </serviceTask>
+
     <!-- ─── Wait for Transaction Update (Message Catch — loops back here) ─── -->
     <intermediateCatchEvent id="waitForTransactionUpdate" name="Wait for Transaction Update">
-      <incoming>flow_validationGw_to_waitTx</incoming>
-      <incoming>flow_updateInProgress_to_waitTx</incoming>
+      <incoming>flow_publishResponse_to_waitTx</incoming>
+      <incoming>flow_updateResultGw_successInProgress</incoming>
       <outgoing>flow_waitTx_to_sendTxKafka</outgoing>
       <messageEventDefinition id="MsgDef_txUpdate" messageRef="Message_ItemPickingEvent"/>
     </intermediateCatchEvent>
@@ -183,17 +191,14 @@
          SEQUENCE FLOWS
          ════════════════════════════════════════════ -->
 
-    <!-- Start → Publish Order -->
     <sequenceFlow id="flow_start_to_publishOrder"
                   sourceRef="startEvent"
                   targetRef="publishOrderTask"/>
 
-    <!-- Publish Order → Wait for Validation -->
     <sequenceFlow id="flow_publishOrder_to_waitValidation"
                   sourceRef="publishOrderTask"
                   targetRef="waitForValidation"/>
 
-    <!-- Wait for Validation → Validation Gateway -->
     <sequenceFlow id="flow_waitValidation_to_validationGw"
                   sourceRef="waitForValidation"
                   targetRef="validationGateway"/>
@@ -205,124 +210,104 @@
       <conditionExpression xsi:type="tFormalExpression">${validationSuccess == false}</conditionExpression>
     </sequenceFlow>
 
-    <!-- Validation Gateway → Wait for TX Update (default: validationSuccess == true) -->
-    <sequenceFlow id="flow_validationGw_to_waitTx"
+    <!-- Validation Gateway → Publish Response (default: validationSuccess == true) -->
+    <sequenceFlow id="flow_validationGw_to_publishResponse"
                   sourceRef="validationGateway"
+                  targetRef="publishResponseTask"/>
+
+    <sequenceFlow id="flow_publishResponse_to_waitTx"
+                  sourceRef="publishResponseTask"
                   targetRef="waitForTransactionUpdate"/>
 
-    <!-- Mark Failed (Validation) → On Workflow Complete (Validation Failed) -->
     <sequenceFlow id="flow_markFailedValidation_to_onComplete"
                   sourceRef="markFailedValidation"
                   targetRef="onWorkflowCompleteValidationFailed"/>
 
-    <!-- On Workflow Complete (Validation Failed) → End -->
     <sequenceFlow id="flow_onCompleteValidFail_to_end"
                   sourceRef="onWorkflowCompleteValidationFailed"
                   targetRef="endValidationFailed"/>
 
-    <!-- Wait for TX Update → Send Transaction Kafka Event -->
     <sequenceFlow id="flow_waitTx_to_sendTxKafka"
                   sourceRef="waitForTransactionUpdate"
                   targetRef="sendTransactionKafkaTask"/>
 
-    <!-- Send Transaction Kafka Event → Command Gateway -->
     <sequenceFlow id="flow_sendTxKafka_to_commandGw"
                   sourceRef="sendTransactionKafkaTask"
                   targetRef="commandGateway"/>
 
-    <!-- Command Gateway → Cancel path -->
     <sequenceFlow id="flow_commandGw_cancel"
                   sourceRef="commandGateway"
                   targetRef="markFailedCancel">
       <conditionExpression xsi:type="tFormalExpression">${command == 'CANCEL'}</conditionExpression>
     </sequenceFlow>
 
-    <!-- Command Gateway → Complete command path -->
     <sequenceFlow id="flow_commandGw_complete"
                   sourceRef="commandGateway"
                   targetRef="markCompleteCmd">
       <conditionExpression xsi:type="tFormalExpression">${command == 'COMPLETE'}</conditionExpression>
     </sequenceFlow>
 
-    <!-- Command Gateway → Update path (default) -->
     <sequenceFlow id="flow_commandGw_update"
                   sourceRef="commandGateway"
                   targetRef="txFailedGateway"/>
 
-    <!-- Mark Failed (Cancel) → On Workflow Complete (Cancel) -->
     <sequenceFlow id="flow_markFailedCancel_to_onComplete"
                   sourceRef="markFailedCancel"
                   targetRef="onWorkflowCompleteCancel"/>
 
-    <!-- On Workflow Complete (Cancel) → End -->
     <sequenceFlow id="flow_onCompleteCancel_to_end"
                   sourceRef="onWorkflowCompleteCancel"
                   targetRef="endCancel"/>
 
-    <!-- Mark Complete (Command) → On Workflow Complete (Complete) -->
     <sequenceFlow id="flow_markCompleteCmd_to_onComplete"
                   sourceRef="markCompleteCmd"
                   targetRef="onWorkflowCompleteComplete"/>
 
-    <!-- On Workflow Complete (Complete) → End -->
     <sequenceFlow id="flow_onCompleteComplete_to_end"
                   sourceRef="onWorkflowCompleteComplete"
                   targetRef="endComplete"/>
 
-    <!-- TX Failed Gateway → TX FAILED path (txStatus == FAILED) -->
     <sequenceFlow id="flow_txFailedGw_failed"
                   sourceRef="txFailedGateway"
                   targetRef="markFailedTx">
       <conditionExpression xsi:type="tFormalExpression">${txStatus == 'FAILED'}</conditionExpression>
     </sequenceFlow>
 
-    <!-- TX Failed Gateway → Update Result Gateway (default: txStatus != FAILED) -->
     <sequenceFlow id="flow_txFailedGw_notFailed"
                   sourceRef="txFailedGateway"
                   targetRef="updateResultGateway"/>
 
-    <!-- Mark Failed (TX Failed) → On Workflow Complete (TX Failed) -->
     <sequenceFlow id="flow_markFailedTx_to_onComplete"
                   sourceRef="markFailedTx"
                   targetRef="onWorkflowCompleteTxFailed"/>
 
-    <!-- On Workflow Complete (TX Failed) → End -->
     <sequenceFlow id="flow_onCompleteTxFailed_to_end"
                   sourceRef="onWorkflowCompleteTxFailed"
                   targetRef="endTxFailed"/>
 
-    <!-- Update Result Gateway → Success + Complete (txComplete) -->
     <sequenceFlow id="flow_updateResultGw_successComplete"
                   sourceRef="updateResultGateway"
                   targetRef="markCompleteUpdate">
       <conditionExpression xsi:type="tFormalExpression">${txComplete == true}</conditionExpression>
     </sequenceFlow>
 
-    <!-- Update Result Gateway → In-Progress (default: txComplete == false) — loop back -->
+    <!-- Loop back to wait for next transaction event -->
     <sequenceFlow id="flow_updateResultGw_successInProgress"
                   sourceRef="updateResultGateway"
                   targetRef="waitForTransactionUpdate"/>
 
-    <!-- Mark Complete (Update) → On Workflow Complete (Update Complete) -->
     <sequenceFlow id="flow_markCompleteUpdate_to_onComplete"
                   sourceRef="markCompleteUpdate"
                   targetRef="onWorkflowCompleteUpdate"/>
 
-    <!-- On Workflow Complete (Update Complete) → End -->
     <sequenceFlow id="flow_onCompleteUpdate_to_end"
                   sourceRef="onWorkflowCompleteUpdate"
                   targetRef="endUpdateComplete"/>
 
-    <!-- ════════════════════════════════════════════
-         LOOP-BACK: update in-progress → wait for next TX
-         (default path of updateResultGateway already points there)
-         ════════════════════════════════════════════ -->
-    <!-- flow_updateResultGw_successInProgress already targets waitForTransactionUpdate -->
-
   </process>
 
   <!-- ═══════════════════════════════════════════════════
-       BPMN Diagram Interchange (minimal layout)
+       BPMN Diagram Interchange (layout)
        ═══════════════════════════════════════════════════ -->
   <bpmndi:BPMNDiagram id="BPMNDiagram_1">
     <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="pickInstructionProcess">
@@ -343,6 +328,7 @@
         <dc:Bounds x="495" y="75" width="50" height="50"/>
       </bpmndi:BPMNShape>
 
+      <!-- FAIL PATH shapes -->
       <bpmndi:BPMNShape id="markFailedValidation_di" bpmnElement="markFailedValidation">
         <dc:Bounds x="600" y="160" width="120" height="80"/>
       </bpmndi:BPMNShape>
@@ -353,6 +339,11 @@
 
       <bpmndi:BPMNShape id="endValidationFailed_di" bpmnElement="endValidationFailed">
         <dc:Bounds x="932" y="182" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- SUCCESS PATH: publish response then wait for TX -->
+      <bpmndi:BPMNShape id="publishResponseTask_di" bpmnElement="publishResponseTask">
+        <dc:Bounds x="600" y="260" width="120" height="80"/>
       </bpmndi:BPMNShape>
 
       <bpmndi:BPMNShape id="waitForTransactionUpdate_di" bpmnElement="waitForTransactionUpdate">
@@ -367,6 +358,7 @@
         <dc:Bounds x="1055" y="275" width="50" height="50"/>
       </bpmndi:BPMNShape>
 
+      <!-- CANCEL PATH shapes -->
       <bpmndi:BPMNShape id="markFailedCancel_di" bpmnElement="markFailedCancel">
         <dc:Bounds x="1160" y="160" width="120" height="80"/>
       </bpmndi:BPMNShape>
@@ -379,6 +371,7 @@
         <dc:Bounds x="1492" y="182" width="36" height="36"/>
       </bpmndi:BPMNShape>
 
+      <!-- COMPLETE COMMAND PATH shapes -->
       <bpmndi:BPMNShape id="markCompleteCmd_di" bpmnElement="markCompleteCmd">
         <dc:Bounds x="1160" y="60" width="120" height="80"/>
       </bpmndi:BPMNShape>
@@ -391,6 +384,7 @@
         <dc:Bounds x="1492" y="82" width="36" height="36"/>
       </bpmndi:BPMNShape>
 
+      <!-- TX FAILED PATH shapes -->
       <bpmndi:BPMNShape id="txFailedGateway_di" bpmnElement="txFailedGateway" isMarkerVisible="true">
         <dc:Bounds x="1055" y="435" width="50" height="50"/>
       </bpmndi:BPMNShape>
@@ -407,6 +401,7 @@
         <dc:Bounds x="1492" y="502" width="36" height="36"/>
       </bpmndi:BPMNShape>
 
+      <!-- UPDATE RESULT PATH shapes -->
       <bpmndi:BPMNShape id="updateResultGateway_di" bpmnElement="updateResultGateway" isMarkerVisible="true">
         <dc:Bounds x="775" y="435" width="50" height="50"/>
       </bpmndi:BPMNShape>
@@ -423,76 +418,107 @@
         <dc:Bounds x="342" y="442" width="36" height="36"/>
       </bpmndi:BPMNShape>
 
-      <!-- Sequence Flow Edges -->
+      <!-- ── Sequence Flow Edges ── -->
       <bpmndi:BPMNEdge id="e_start_pub" bpmnElement="flow_start_to_publishOrder">
         <di:waypoint x="188" y="100"/><di:waypoint x="240" y="100"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_pub_waitVal" bpmnElement="flow_publishOrder_to_waitValidation">
         <di:waypoint x="360" y="100"/><di:waypoint x="412" y="100"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_waitVal_gw" bpmnElement="flow_waitValidation_to_validationGw">
         <di:waypoint x="448" y="100"/><di:waypoint x="495" y="100"/>
       </bpmndi:BPMNEdge>
+
+      <!-- Gateway → FAIL path -->
       <bpmndi:BPMNEdge id="e_gw_failed" bpmnElement="flow_validationGw_failed">
         <di:waypoint x="520" y="125"/><di:waypoint x="520" y="200"/><di:waypoint x="600" y="200"/>
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="e_gw_waitTx" bpmnElement="flow_validationGw_to_waitTx">
-        <di:waypoint x="545" y="100"/><di:waypoint x="818" y="100"/><di:waypoint x="818" y="282"/>
+
+      <!-- Gateway → Publish Response (success/default) -->
+      <bpmndi:BPMNEdge id="e_gw_publishResponse" bpmnElement="flow_validationGw_to_publishResponse">
+        <di:waypoint x="520" y="125"/><di:waypoint x="520" y="300"/><di:waypoint x="600" y="300"/>
       </bpmndi:BPMNEdge>
+
+      <!-- Publish Response → Wait for TX -->
+      <bpmndi:BPMNEdge id="e_publishResponse_waitTx" bpmnElement="flow_publishResponse_to_waitTx">
+        <di:waypoint x="720" y="300"/><di:waypoint x="800" y="300"/>
+      </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_markFailVal_onComplete" bpmnElement="flow_markFailedValidation_to_onComplete">
         <di:waypoint x="720" y="200"/><di:waypoint x="760" y="200"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_onCompleteVF_end" bpmnElement="flow_onCompleteValidFail_to_end">
         <di:waypoint x="880" y="200"/><di:waypoint x="932" y="200"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_waitTx_sendTx" bpmnElement="flow_waitTx_to_sendTxKafka">
         <di:waypoint x="836" y="300"/><di:waypoint x="880" y="300"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_sendTx_cmdGw" bpmnElement="flow_sendTxKafka_to_commandGw">
         <di:waypoint x="1000" y="300"/><di:waypoint x="1055" y="300"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_cmdGw_cancel" bpmnElement="flow_commandGw_cancel">
         <di:waypoint x="1080" y="275"/><di:waypoint x="1080" y="200"/><di:waypoint x="1160" y="200"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_cmdGw_complete" bpmnElement="flow_commandGw_complete">
         <di:waypoint x="1080" y="275"/><di:waypoint x="1080" y="40"/><di:waypoint x="1220" y="40"/><di:waypoint x="1220" y="60"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_cmdGw_update" bpmnElement="flow_commandGw_update">
         <di:waypoint x="1080" y="325"/><di:waypoint x="1080" y="435"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_markFailCancel_onComplete" bpmnElement="flow_markFailedCancel_to_onComplete">
         <di:waypoint x="1280" y="200"/><di:waypoint x="1320" y="200"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_onCompleteCancel_end" bpmnElement="flow_onCompleteCancel_to_end">
         <di:waypoint x="1440" y="200"/><di:waypoint x="1492" y="200"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_markCompleteCmd_onComplete" bpmnElement="flow_markCompleteCmd_to_onComplete">
         <di:waypoint x="1280" y="100"/><di:waypoint x="1320" y="100"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_onCompleteComplete_end" bpmnElement="flow_onCompleteComplete_to_end">
         <di:waypoint x="1440" y="100"/><di:waypoint x="1492" y="100"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_txFailed_failed" bpmnElement="flow_txFailedGw_failed">
         <di:waypoint x="1105" y="460"/><di:waypoint x="1220" y="460"/><di:waypoint x="1220" y="480"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_txFailed_notFailed" bpmnElement="flow_txFailedGw_notFailed">
         <di:waypoint x="1055" y="460"/><di:waypoint x="825" y="460"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_markFailedTx_onComplete" bpmnElement="flow_markFailedTx_to_onComplete">
         <di:waypoint x="1280" y="520"/><di:waypoint x="1320" y="520"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_onCompleteTxFailed_end" bpmnElement="flow_onCompleteTxFailed_to_end">
         <di:waypoint x="1440" y="520"/><di:waypoint x="1492" y="520"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_updateResult_complete" bpmnElement="flow_updateResultGw_successComplete">
         <di:waypoint x="775" y="460"/><di:waypoint x="720" y="460"/>
       </bpmndi:BPMNEdge>
+
+      <!-- Loop back: in-progress → wait for next TX update -->
       <bpmndi:BPMNEdge id="e_updateResult_inProgress" bpmnElement="flow_updateResultGw_successInProgress">
-        <di:waypoint x="775" y="460"/><di:waypoint x="740" y="460"/><di:waypoint x="740" y="300"/><di:waypoint x="800" y="300"/>
+        <di:waypoint x="800" y="460"/><di:waypoint x="818" y="460"/><di:waypoint x="818" y="318"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_markCompleteUpdate_onComplete" bpmnElement="flow_markCompleteUpdate_to_onComplete">
         <di:waypoint x="600" y="460"/><di:waypoint x="580" y="460"/>
       </bpmndi:BPMNEdge>
+
       <bpmndi:BPMNEdge id="e_onCompleteUpdate_end" bpmnElement="flow_onCompleteUpdate_to_end">
         <di:waypoint x="460" y="460"/><di:waypoint x="378" y="460"/>
       </bpmndi:BPMNEdge>

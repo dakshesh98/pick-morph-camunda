@@ -2,6 +2,7 @@ package com.butler.aeorder.downstream.listener;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.butler.aeorder.dto.ae.PickListResponse;
+import com.butler.aeorder.dto.ae.PickListResponseEvent;
 import lombok.extern.slf4j.Slf4j;
 import org.camunda.bpm.engine.MismatchingMessageCorrelationException;
 import org.camunda.bpm.engine.RuntimeService;
@@ -38,9 +39,14 @@ public class PickListResponseListener {
     public void listen(@Payload String payload) {
         PickListResponse response;
         try {
-            response = objectMapper.readValue(payload, PickListResponse.class);
+            PickListResponseEvent envelope = objectMapper.readValue(payload, PickListResponseEvent.class);
+            if (envelope.getPayload() == null) {
+                log.error("PickListResponseEvent has no payload — dropping message");
+                return;
+            }
+            response = envelope.getPayload();
         } catch (Exception e) {
-            log.error("Failed to deserialize PickListResponse from Kafka message: {}", e.getMessage());
+            log.error("Failed to deserialize PickListResponseEvent from Kafka message: {}", e.getMessage());
             return;
         }
 

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+import "google/protobuf/struct.proto";
+
+option java_package = "com.greyorange.butler.pick.order.grpc";
+option java_outer_classname = "PickOrderServiceProto";
+
+service PickOrderService {
+    rpc GetOrderData(GetOrderDataRequest) returns (GetOrderDataResponse);
+}
+
+message GetOrderDataRequest {
+    string order_id = 1;
+}
+
+// order_data is the full order_node record serialized as a JSON object.
+// google.protobuf.Struct maps directly to a JSON object so clients receive
+// a native nested object without needing a second parse step.
+message GetOrderDataResponse {
+    google.protobuf.Struct order_data = 1;
+}

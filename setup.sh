@@ -19,19 +19,42 @@ POSTGRES="${PROJECT}-postgres-1"
 KAFKA="${PROJECT}-kafka-1"
 SPRING="${PROJECT}-spring-camunda-1"
 
+TENANT="${KAFKA_TENANT_PREFIX:-gor}"
+
 KAFKA_TOPICS=(
-  "gor.pick-instruction.events"
-  "gor.pick-list.requests"
-  "gor.pick-list.response"
-  "gor.pick-list.events"
-  "gor.item_picked.events"
-  "gor.order_update.events"
+  "${TENANT}.pick-instruction.events"
+  "${TENANT}.pick-instruction.requests"
+  "${TENANT}.pick-instruction.response"
+  "${TENANT}.pick-list.requests"
+  "${TENANT}.pick-list.response"
+  "${TENANT}.pick-list.events"
+  "${TENANT}.item_picked.events"
+  "${TENANT}.order_update.events"
+  "${TENANT}.transaction.updates"
+  "${TENANT}.transaction.events"
+  "${TENANT}.workflow.complete.events"
 )
 
 # ── helpers ──────────────────────────────────────────────────
+SETUP_START=$(date +%s)
+
 log()  { echo "[setup] $*"; }
 ok()   { echo "[setup] ✓ $*"; }
 warn() { echo "[setup] ⚠ $*"; }
+
+elapsed() {
+  local now; now=$(date +%s)
+  echo "$((now - SETUP_START))s"
+}
+
+step_start() {
+  _STEP_START=$(date +%s)
+}
+
+step_done() {
+  local now; now=$(date +%s)
+  echo "[setup]   └─ done in $((now - _STEP_START))s"
+}
 
 pg() {
   docker exec "$POSTGRES" psql -U appuser -d app_db -c "$1"
@@ -50,7 +73,7 @@ wait_healthy() {
     printf "."
   done
   echo ""
-  ok "spring-camunda is healthy."
+  ok "spring-camunda is healthy. ($(elapsed) total)"
 }
 
 # ── main ─────────────────────────────────────────────────────
@@ -59,12 +82,15 @@ if docker ps --format '{{.Names}}' | grep -q "^${SPRING}$"; then
   log "spring-camunda is RUNNING → hot cleanup"
 
   # 1. Truncate app tables
+  step_start
   log "Truncating app tables..."
-  pg "TRUNCATE TABLE outbox_event, transaction_status, ae_order RESTART IDENTITY CASCADE;"
+  pg "TRUNCATE TABLE outbox_event, transaction_status, ae_orders_mapping, ae_order RESTART IDENTITY CASCADE;"
   ok "App tables cleared."
+  step_done
 
   # 2. Truncate Camunda runtime & history tables
   #    Order matters: children before parents to satisfy FK constraints
+  step_start
   log "Truncating Camunda runtime/history tables..."
   pg "
     TRUNCATE TABLE
@@ -78,6 +104,11 @@ if docker ps --format '{{.Names}}' | grep -q "^${SPRING}$"; then
       act_hi_varinst,
       act_hi_taskinst,
       act_hi_actinst,
+      act_hi_dec_in,
+      act_hi_dec_out,
+      act_hi_decinst,
+      act_hi_caseactinst,
+      act_hi_caseinst,
       act_hi_incident,
       act_hi_batch,
       act_hi_procinst,
@@ -89,12 +120,18 @@ if docker ps --format '{{.Names}}' | grep -q "^${SPRING}$"; then
       act_ru_variable,
       act_ru_event_subscr,
       act_ru_job,
-      act_ru_execution
+      act_ru_case_sentry_part,
+      act_ru_case_execution,
+      act_ru_execution,
+      act_ru_meter_log,
+      act_ru_task_meter_log
     CASCADE;
   "
   ok "Camunda tables cleared."
+  step_done
 
   # 3. Delete Kafka topics
+  step_start
   log "Deleting Kafka topics..."
   for topic in "${KAFKA_TOPICS[@]}"; do
     if docker exec "$KAFKA" /opt/kafka/bin/kafka-topics.sh \
@@ -108,24 +145,33 @@ if docker ps --format '{{.Names}}' | grep -q "^${SPRING}$"; then
       warn "Topic not found (skipped): $topic"
     fi
   done
+  step_done
 
   # 4. Rebuild & restart only spring-camunda
+  step_start
   log "Rebuilding spring-camunda image..."
   docker compose build spring-camunda
   log "Restarting spring-camunda container..."
   docker compose stop spring-camunda
   docker compose up -d spring-camunda
+  step_done
 
   wait_healthy
 
 else
   log "spring-camunda is NOT running → cold start"
 
+  step_start
   docker compose down -v
+  step_done
+
+  step_start
   log "Starting all services..."
   docker compose up --build -d
+  step_done
 
   log "Tailing logs (Ctrl+C once you see 'Started SpringCamundaApplication')..."
   docker compose logs -f spring-camunda
+  log "Cold start complete. ($(elapsed) total)"
 
 fi

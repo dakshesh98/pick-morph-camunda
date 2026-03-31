@@ -49,7 +49,7 @@ public class PickListEventListener {
             return;
         }
 
-        PickListEvent.Payload eventPayload = event.getValue() != null ? event.getValue().getPayload() : null;
+        PickListEvent.Payload eventPayload = event.getPayload();
         if (eventPayload == null) {
             log.error("PickListEvent has no payload — dropping message");
             return;
@@ -81,15 +81,13 @@ public class PickListEventListener {
         }
     }
 
-    /** Resolves event_type: headers first, then payload.attributes fallback. */
+    /** Resolves event_type: context first, then payload.attributes fallback. */
     private String resolveEventType(PickListEvent event) {
-        if (event.getHeaders() != null && event.getHeaders().getEventType() != null) {
-            return event.getHeaders().getEventType();
+        if (event.getContext() != null && event.getContext().getEventType() != null) {
+            return event.getContext().getEventType();
         }
-        if (event.getValue() != null
-                && event.getValue().getPayload() != null
-                && event.getValue().getPayload().getAttributes() != null) {
-            return event.getValue().getPayload().getAttributes().getEventType();
+        if (event.getPayload() != null && event.getPayload().getAttributes() != null) {
+            return event.getPayload().getAttributes().getEventType();
         }
         return "unknown";
     }

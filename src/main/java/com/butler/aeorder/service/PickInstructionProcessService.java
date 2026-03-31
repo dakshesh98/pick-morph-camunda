@@ -2,6 +2,8 @@ package com.butler.aeorder.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.butler.aeorder.dto.PickInstruction;
+import com.butler.aeorder.dto.PickInstructionRequestMessage;
+import org.camunda.bpm.engine.ProcessEngineException;
 import lombok.extern.slf4j.Slf4j;
 import org.camunda.bpm.engine.RuntimeService;
 import org.camunda.bpm.engine.runtime.ProcessInstance;
@@ -57,6 +59,36 @@ public class PickInstructionProcessService {
         } catch (Exception e) {
             log.error("Failed to start Camunda process for pickInstructionId: {}", instruction.getPickInstructionId(), e);
             throw new RuntimeException("Failed to start process for pickInstructionId: " + instruction.getPickInstructionId(), e);
+        }
+    }
+
+    /**
+     * Start a new Camunda process instance from a PickInstructionRequestMessage (Kafka-triggered).
+     * Idempotent: duplicate starts for the same pickId are silently ignored.
+     */
+    public void startProcess(PickInstructionRequestMessage msg) {
+        String businessKey = "Order_workflow_" + msg.getId();
+        try {
+            String instructionJson = objectMapper.writeValueAsString(msg);
+            Map<String, Object> vars = new HashMap<>();
+            vars.put("pickId", msg.getId());
+            vars.put("pickInstructionId", msg.getId());
+            vars.put("orderId", msg.getOrderId());
+            vars.put("instructionJson", instructionJson);
+            vars.put("finalStatus", "UNKNOWN");
+            runtimeService.startProcessInstanceByKey("pickInstructionProcess", businessKey, vars);
+            log.info("Started Camunda process for pickId: {}", msg.getId());
+        } catch (ProcessEngineException e) {
+            String message = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+            if (message.contains("unique") || message.contains("duplicate") || message.contains("already exists")) {
+                log.warn("Process already running for pickId: {} — duplicate start suppressed", msg.getId());
+                return;
+            }
+            log.error("Failed to start Camunda process for pickId: {}", msg.getId(), e);
+            throw new RuntimeException("Failed to start process for pickId: " + msg.getId(), e);
+        } catch (Exception e) {
+            log.error("Failed to start Camunda process for pickId: {}", msg.getId(), e);
+            throw new RuntimeException("Failed to start process for pickId: " + msg.getId(), e);
         }
     }
 

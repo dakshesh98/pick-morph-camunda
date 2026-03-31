@@ -5,13 +5,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.butler.aeorder.dto.ItemPickedEvent;
 import com.butler.aeorder.dto.OrderUpdateEvent;
 import com.butler.aeorder.dto.PickInstruction;
+import com.butler.aeorder.dto.PickInstructionRequestMessage;
 import com.butler.aeorder.dto.ae.PickListEvent;
-import com.butler.aeorder.dto.ae.PickListRequest;
 import com.butler.aeorder.grpc.ButlerCoreGrpcClient;
 import com.butler.aeorder.model.AeOrder;
+import com.butler.aeorder.model.AeOrdersMapping;
 import com.butler.aeorder.model.OutboxEvent;
 import com.butler.aeorder.model.TransactionStatus;
 import com.butler.aeorder.repository.AeOrderRepository;
+import com.butler.aeorder.repository.AeOrdersMappingRepository;
 import com.butler.aeorder.repository.OutboxEventRepository;
 import com.butler.aeorder.repository.TransactionStatusRepository;
 import com.greyorange.butler.core.grpc.GetPickInstructionStatusResponse;
@@ -23,6 +25,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,9 +44,12 @@ public class PickInstructionService {
     private final ButlerCoreGrpcClient butlerCoreGrpcClient;
     private final TransactionStatusRepository transactionStatusRepository;
     private final AeOrderRepository aeOrderRepository;
+    private final AeOrdersMappingRepository aeOrdersMappingRepository;
     private final OutboxEventRepository outboxEventRepository;
     private final ObjectMapper objectMapper;
-    private final PickListRequestMapper pickListRequestMapper;
+    private final AeOrderBuilderService aeOrderBuilderService;
+    private final AeOrderPersistenceService aeOrderPersistenceService;
+    private final OutboxService outboxService;
 
     @Value("${kafka.topic.pick-list-requests}")
     private String pickListRequestsTopic;
@@ -53,192 +60,234 @@ public class PickInstructionService {
     @Value("${kafka.topic.order-update-events}")
     private String orderUpdateEventsTopic;
 
+    @Value("${kafka.topics.pick-instruction-response}")
+    private String pickInstructionResponseTopic;
+
     public PickInstructionService(KafkaTemplate<String, Object> kafkaTemplate,
                                   ButlerCoreGrpcClient butlerCoreGrpcClient,
                                   TransactionStatusRepository transactionStatusRepository,
                                   AeOrderRepository aeOrderRepository,
+                                  AeOrdersMappingRepository aeOrdersMappingRepository,
                                   OutboxEventRepository outboxEventRepository,
                                   ObjectMapper objectMapper,
-                                  PickListRequestMapper pickListRequestMapper) {
+                                  AeOrderBuilderService aeOrderBuilderService,
+                                  AeOrderPersistenceService aeOrderPersistenceService,
+                                  OutboxService outboxService) {
         this.kafkaTemplate = kafkaTemplate;
         this.butlerCoreGrpcClient = butlerCoreGrpcClient;
         this.transactionStatusRepository = transactionStatusRepository;
         this.aeOrderRepository = aeOrderRepository;
+        this.aeOrdersMappingRepository = aeOrdersMappingRepository;
         this.outboxEventRepository = outboxEventRepository;
         this.objectMapper = objectMapper;
-        this.pickListRequestMapper = pickListRequestMapper;
+        this.aeOrderBuilderService = aeOrderBuilderService;
+        this.aeOrderPersistenceService = aeOrderPersistenceService;
+        this.outboxService = outboxService;
     }
 
-    // ─── Step 2: Send to AE ──────────────────────────────────────────────────
+    // ─── Kafka-triggered workflow start ─────────────────────────────────────
 
     /**
-     * Atomically (within a single DB transaction):
-     *   1. Persist the PickListRequest to ae_order (idempotent — skips if already present).
-     *   2. Write an outbox_event row for the pick-list.requests Kafka publish.
-     *
-     * The OutboxRelayService picks up the PENDING outbox row and publishes to Kafka,
-     * guaranteeing delivery even if the process crashes between the DB write and Kafka send.
-     *
-     * On Camunda RETRY, step 1 is skipped (already persisted) but a new outbox row is
-     * written so the message is re-published — idempotent on the AE side by pickInstructionId.
+     * Build AePickListRequest from the Kafka message, persist to ae_order table,
+     * and publish to "pick-list.requests" via transactional outbox.
      */
     @Transactional
-    public void persistAeOrder(String pickInstructionId, PickListRequest request) {
-        try {
-            // Kafka outbox payload — clean PickListRequest (no internal status fields)
-            String requestJson = objectMapper.writeValueAsString(request);
+    public void publishPickListRequest(PickInstructionRequestMessage msg) {
+        com.butler.aeorder.dto.AePickListRequest request = aeOrderBuilderService.build(msg);
+        aeOrderPersistenceService.saveAeOrder(request);
+        outboxService.save(pickListRequestsTopic, msg.getId(), request, "pick_list_request");
+        log.info("Persisted AePickListRequest and queued to pick-list.requests for pickId: {}", msg.getId());
+    }
 
-            // ae_order payload — same structure with OL status injected
-            @SuppressWarnings("unchecked")
-            Map<String, Object> payloadMap = objectMapper.convertValue(
-                    request, new TypeReference<Map<String, Object>>() {});
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> storedSRs =
-                    (List<Map<String, Object>>) payloadMap.get("serviceRequests");
-            if (storedSRs != null) {
-                for (Map<String, Object> storedSR : storedSRs) {
-                    storedSR.put("status", AEOrderTransformer.computeOlStatus(storedSR));
-                }
-                String orderStatus = AEOrderTransformer.computeOrderStatus(storedSRs);
-                payloadMap.put("status", orderStatus);
-                log.info("Status injected on creation — pickInstructionId: {}, orderStatus: {}", pickInstructionId, orderStatus);
+    /**
+     * Atomically mark AE order as FAILED and publish failure response to pick-instruction.response.
+     * Called on the BPMN validation-failure path.
+     */
+    @Transactional
+    public void terminateWithFailureResponse(String pickId, String status, String orderId,
+            String message, String errorCode, String errorsJson) {
+        aeOrderPersistenceService.markAsFailed(pickId);
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("id", pickId);
+        response.put("order_id", orderId);
+        response.put("status", status);
+        response.put("message", message);
+        if (errorCode != null) response.put("errorCode", errorCode);
+        if (errorsJson != null) {
+            try {
+                response.put("errors", objectMapper.readValue(errorsJson, List.class));
+            } catch (Exception e) {
+                log.warn("Failed to parse errorsJson for pickId: {}", pickId, e);
             }
-            String aeOrderPayloadJson = objectMapper.writeValueAsString(payloadMap);
-
-            if (!aeOrderRepository.existsById(pickInstructionId)) {
-                String creationOrderStatus = AEOrderTransformer.computeOrderStatus(storedSRs);
-                AeOrder order = new AeOrder();
-                order.setExternalServiceRequestId(pickInstructionId);
-                order.setPayload(aeOrderPayloadJson);
-                order.setStatus(creationOrderStatus != null ? creationOrderStatus : "created");
-                order.setState("created");
-                order.setCreatedAt(Instant.now());
-                order.setUpdatedAt(Instant.now());
-                aeOrderRepository.save(order);
-                log.info("Persisted ae_order for pickInstructionId: {}", pickInstructionId);
-            } else {
-                log.info("ae_order already exists for pickInstructionId: {} — skipping persist (idempotent on RETRY)", pickInstructionId);
-            }
-
-            // Enqueue outbox event in the same transaction — relay publishes to Kafka
-            outboxEventRepository.save(OutboxEvent.builder()
-                    .aggregateId(pickInstructionId)
-                    .topic(pickListRequestsTopic)
-                    .payload(requestJson)
-                    .status("PENDING")
-                    .createdAt(Instant.now())
-                    .build());
-            log.info("Enqueued pick-list.requests outbox event for pickInstructionId: {}", pickInstructionId);
-
-        } catch (Exception e) {
-            log.error("Failed to persist ae_order / outbox event for pickInstructionId: {}", pickInstructionId, e);
-            throw new RuntimeException("ae_order persist failed for pickInstructionId: " + pickInstructionId, e);
         }
+        outboxService.save(pickInstructionResponseTopic, pickId, response, "pick_instruction_response");
+        log.info("Marked AE order as FAILED and queued failure response | pickId: {}", pickId);
+    }
+
+    /**
+     * Publish pick-instruction.response to notify butler_server of validation outcome.
+     */
+    @Transactional
+    public void publishPickInstructionResponse(String pickId, String status,
+            String orderId, String orderlineId, String message, String errorCode, String errorsJson) {
+        boolean success = "SUCCESS".equalsIgnoreCase(status);
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("id", pickId);
+        response.put("order_id", orderId);
+        response.put("status", status);
+        response.put("message", message);
+        if (success && orderlineId != null) {
+            response.put("orderline_id", orderlineId);
+        }
+        if (!success) {
+            if (errorCode != null) response.put("errorCode", errorCode);
+            if (errorsJson != null) {
+                try {
+                    response.put("errors", objectMapper.readValue(errorsJson, List.class));
+                } catch (Exception e) {
+                    log.warn("Failed to parse errorsJson for pickId: {}", pickId, e);
+                }
+            }
+        }
+        outboxService.save(pickInstructionResponseTopic, pickId, response, "pick_instruction_response");
+        log.info("Queued pick-instruction.response for pickId: {} | status: {}", pickId, status);
     }
 
     // ─── Step 3: Update ae_order from events ────────────────────────────────
 
     /**
-     * Selectively updates ae_order.payload when a pick-list.events event arrives.
+     * Selectively updates structured ae_order columns when a pick-list.events event arrives.
      *
      * Two levels of update (null-safe — never clobbers existing values with null):
-     *   1. Parent (Payload) level:  state, sub_state, attributes, actuals, expectations
-     *   2. Per-serviceRequest level (matched by externalServiceRequestId):
-     *      state, status, sub_state, actuals, expectations, attributes
+     *   1. Parent AeOrder: state, subState, actuals, expectations, attributes (JSONB merged)
+     *   2. Child AeOrder rows (matched via ae_orders_mapping by externalServiceRequestId):
+     *      state, subState, status, actuals, expectations, attributes (JSONB merged)
      *
-     * Creates a minimal ae_order record if one doesn't exist yet (guards against
+     * Creates a minimal parent ae_order record if one doesn't exist yet (guards against
      * rare cases where the event arrives before the Camunda delegate has run).
      */
     public String updateAeOrderFromEvent(PickListEvent event) {
-        String pickInstructionId = event.getValue().getPayload().getExternalServiceRequestId();
+        String pickInstructionId = event.getPayload().getExternalServiceRequestId();
         String computedOrderStatus = "created";
 
-        AeOrder order = aeOrderRepository.findById(pickInstructionId).orElseGet(() -> {
-            log.warn("ae_order not found for pickInstructionId: {} during event update — creating partial record", pickInstructionId);
-            AeOrder o = new AeOrder();
-            o.setExternalServiceRequestId(pickInstructionId);
-            o.setCreatedAt(Instant.now());
-            return o;
-        });
+        AeOrder parent = aeOrderRepository.findByExternalServiceRequestId(pickInstructionId)
+                .orElseGet(() -> {
+                    log.warn("ae_order not found for pickInstructionId: {} during event update — creating partial record", pickInstructionId);
+                    return AeOrder.builder()
+                            .externalServiceRequestId(pickInstructionId)
+                            .type("PICK")
+                            .state("CREATED")
+                            .subState("CREATED")
+                            .status("CREATED")
+                            .actuals("{}")
+                            .isDeleted(false)
+                            .stages("[]")
+                            .onHold(false)
+                            .createdAt(LocalDateTime.now())
+                            .updatedAt(LocalDateTime.now())
+                            .build();
+                });
 
         try {
-            // Deserialize as generic map — allows merging fields not in PickListRequest DTO
-            Map<String, Object> payloadMap = order.getPayload() != null
-                    ? objectMapper.readValue(order.getPayload(), new TypeReference<Map<String, Object>>() {})
-                    : new LinkedHashMap<>();
+            PickListEvent.Payload evtPayload = event.getPayload();
 
-            PickListEvent.Payload evtPayload = event.getValue().getPayload();
-
-            // ── Level 1: parent (Payload) selective update ────────────────────
-            mergeIfNotNull(payloadMap, "state",        evtPayload.getState());
-            mergeIfNotNull(payloadMap, "actuals",      evtPayload.getActuals());
-            mergeIfNotNull(payloadMap, "expectations", evtPayload.getExpectations());
+            // ── Level 1: parent selective update ─────────────────────────────
+            if (evtPayload.getState() != null) {
+                parent.setState(evtPayload.getState());
+            }
+            if (evtPayload.getAttributes() != null && evtPayload.getAttributes().getSubState() != null) {
+                parent.setSubState(evtPayload.getAttributes().getSubState());
+            }
+            if (evtPayload.getActuals() != null) {
+                parent.setActuals(objectMapper.writeValueAsString(evtPayload.getActuals()));
+            }
+            if (evtPayload.getExpectations() != null) {
+                parent.setExpectations(objectMapper.writeValueAsString(evtPayload.getExpectations()));
+            }
             if (evtPayload.getAttributes() != null) {
-                mergeIfNotNull(payloadMap, "sub_state", evtPayload.getAttributes().getSubState());
-                // Merge individual fields into existing stored attributes — never replace entirely
-                // so original order_options / customer_order_info are preserved for tpid extraction.
-                @SuppressWarnings("unchecked")
-                Map<String, Object> storedTopAttrs = (Map<String, Object>)
-                        payloadMap.computeIfAbsent("attributes", k -> new LinkedHashMap<>());
+                // Merge into existing attributes JSON — preserves original fields
+                Map<String, Object> storedAttrs = parent.getAttributes() != null
+                        ? objectMapper.readValue(parent.getAttributes(), new TypeReference<Map<String, Object>>() {})
+                        : new LinkedHashMap<>();
                 PickListEvent.PayloadAttributes ea = evtPayload.getAttributes();
-                mergeIfNotNull(storedTopAttrs, "event_type",    ea.getEventType());
-                mergeIfNotNull(storedTopAttrs, "sub_state",     ea.getSubState());
-                mergeIfNotNull(storedTopAttrs, "cust_identity", ea.getCustIdentity());
-                mergeIfNotNull(storedTopAttrs, "destination",   ea.getDestination());
-                mergeIfNotNull(storedTopAttrs, "flow_name",     ea.getFlowName());
+                mergeIfNotNull(storedAttrs, "event_type",    ea.getEventType());
+                mergeIfNotNull(storedAttrs, "sub_state",     ea.getSubState());
+                mergeIfNotNull(storedAttrs, "cust_identity", ea.getCustIdentity());
+                mergeIfNotNull(storedAttrs, "destination",   ea.getDestination());
+                mergeIfNotNull(storedAttrs, "flow_name",     ea.getFlowName());
+                parent.setAttributes(objectMapper.writeValueAsString(storedAttrs));
             }
 
-            // ── Level 2: per-serviceRequest selective update ──────────────────
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> storedSRs =
-                    (List<Map<String, Object>>) payloadMap.get("serviceRequests");
+            // ── Level 2: per-child AeOrder selective update ───────────────────
+            List<AeOrdersMapping> mappings = aeOrdersMappingRepository
+                    .findByParentExternalServiceRequestId(pickInstructionId);
+            List<Map<String, Object>> childStatusMaps = new ArrayList<>();
 
-            if (storedSRs != null && evtPayload.getServiceRequests() != null) {
-                for (PickListEvent.ServiceRequest evtSR : evtPayload.getServiceRequests()) {
-                    storedSRs.stream()
-                            .filter(stored -> evtSR.getExternalServiceRequestId() != null
-                                    && evtSR.getExternalServiceRequestId()
-                                            .equals(stored.get("externalServiceRequestId")))
+            for (AeOrdersMapping mapping : mappings) {
+                String childId = mapping.getChildExternalServiceRequestId();
+                Optional<AeOrder> childOpt = aeOrderRepository.findByExternalServiceRequestId(childId);
+                if (childOpt.isEmpty()) continue;
+                AeOrder child = childOpt.get();
+
+                // Apply matching event SR fields
+                if (evtPayload.getServiceRequests() != null) {
+                    evtPayload.getServiceRequests().stream()
+                            .filter(sr -> childId.equals(sr.getExternalServiceRequestId()))
                             .findFirst()
-                            .ifPresent(storedSR -> {
-                                mergeIfNotNull(storedSR, "state",        evtSR.getState());
-                                mergeIfNotNull(storedSR, "status",       evtSR.getStatus());
-                                mergeIfNotNull(storedSR, "actuals",      evtSR.getActuals());
-                                mergeIfNotNull(storedSR, "expectations", evtSR.getExpectations());
-                                                if (evtSR.getAttributes() != null) {
-                                    mergeIfNotNull(storedSR, "sub_state",
-                                            evtSR.getAttributes().getSubState());
-                                    // Merge into existing SR attributes — preserves extra_info, location etc.
-                                    @SuppressWarnings("unchecked")
-                                    Map<String, Object> storedSRAttrs = (Map<String, Object>)
-                                            storedSR.computeIfAbsent("attributes", k -> new LinkedHashMap<>());
-                                    PickListEvent.ServiceRequestAttributes sa = evtSR.getAttributes();
-                                    mergeIfNotNull(storedSRAttrs, "sub_state",       sa.getSubState());
-                                    mergeIfNotNull(storedSRAttrs, "orderType",       sa.getOrderType());
-                                    mergeIfNotNull(storedSRAttrs, "simple_priority", sa.getSimplePriority());
+                            .ifPresent(evtSR -> {
+                                if (evtSR.getState() != null) child.setState(evtSR.getState());
+                                if (evtSR.getAttributes() != null
+                                        && evtSR.getAttributes().getSubState() != null) {
+                                    child.setSubState(evtSR.getAttributes().getSubState());
+                                }
+                                try {
+                                    if (evtSR.getActuals() != null) {
+                                        child.setActuals(objectMapper.writeValueAsString(evtSR.getActuals()));
+                                    }
+                                    if (evtSR.getExpectations() != null) {
+                                        child.setExpectations(objectMapper.writeValueAsString(evtSR.getExpectations()));
+                                    }
+                                    if (evtSR.getAttributes() != null) {
+                                        Map<String, Object> storedSRAttrs = child.getAttributes() != null
+                                                ? objectMapper.readValue(child.getAttributes(), new TypeReference<Map<String, Object>>() {})
+                                                : new LinkedHashMap<>();
+                                        PickListEvent.ServiceRequestAttributes sa = evtSR.getAttributes();
+                                        mergeIfNotNull(storedSRAttrs, "sub_state",       sa.getSubState());
+                                        mergeIfNotNull(storedSRAttrs, "orderType",        sa.getOrderType());
+                                        mergeIfNotNull(storedSRAttrs, "simple_priority",  sa.getSimplePriority());
+                                        child.setAttributes(objectMapper.writeValueAsString(storedSRAttrs));
+                                    }
+                                } catch (Exception ex) {
+                                    log.warn("Failed to merge SR fields for child: {}", childId, ex);
                                 }
                             });
                 }
-            }
 
-            // ── Level 3: inject OL status per SR, then derive and inject order status ─
-            if (storedSRs != null) {
-                for (Map<String, Object> storedSR : storedSRs) {
-                    storedSR.put("status", AEOrderTransformer.computeOlStatus(storedSR));
+                // Compute OL status for this child and save
+                try {
+                    Map<String, Object> srMap = new LinkedHashMap<>();
+                    srMap.put("actuals", child.getActuals() != null
+                            ? objectMapper.readValue(child.getActuals(), new TypeReference<Map<String, Object>>() {}) : null);
+                    srMap.put("expectations", child.getExpectations() != null
+                            ? objectMapper.readValue(child.getExpectations(), new TypeReference<Map<String, Object>>() {}) : null);
+                    String olStatus = AEOrderTransformer.computeOlStatus(srMap);
+                    child.setStatus(olStatus);
+                    child.setUpdatedAt(LocalDateTime.now());
+                    aeOrderRepository.save(child);
+                    Map<String, Object> statusEntry = new LinkedHashMap<>();
+                    statusEntry.put("status", olStatus);
+                    childStatusMaps.add(statusEntry);
+                } catch (Exception ex) {
+                    log.warn("Failed to compute/set OL status for child: {}", childId, ex);
                 }
-                computedOrderStatus = AEOrderTransformer.computeOrderStatus(storedSRs);
-                payloadMap.put("status", computedOrderStatus);
-                log.info("Status injected — pickInstructionId: {}, orderStatus: {}", pickInstructionId, computedOrderStatus);
             }
 
-            order.setPayload(objectMapper.writeValueAsString(payloadMap));
-            order.setStatus(computedOrderStatus);
-            if (evtPayload.getState() != null) {
-                order.setState(evtPayload.getState());
-            }
-            order.setUpdatedAt(Instant.now());
-            aeOrderRepository.save(order);
-            log.info("Updated ae_order for pickInstructionId: {}, aeState: {}, orderStatus: {}",
+            // ── Level 3: derive aggregate order status from children ──────────
+            computedOrderStatus = AEOrderTransformer.computeOrderStatus(childStatusMaps);
+            parent.setStatus(computedOrderStatus);
+            parent.setUpdatedAt(LocalDateTime.now());
+            aeOrderRepository.save(parent);
+            log.info("Updated ae_order | pickInstructionId: {}, state: {}, orderStatus: {}",
                     pickInstructionId, evtPayload.getState(), computedOrderStatus);
 
         } catch (Exception e) {
@@ -258,7 +307,7 @@ public class PickInstructionService {
         // Step 1: always update ae_order
         String orderStatus = updateAeOrderFromEvent(event);
 
-        PickListEvent.Payload payload = event.getValue() != null ? event.getValue().getPayload() : null;
+        PickListEvent.Payload payload = event.getPayload();
         if (payload != null && payload.getServiceRequests() != null) {
             String state    = payload.getState();
             String subState = payload.getAttributes() != null ? payload.getAttributes().getSubState() : null;
@@ -288,15 +337,12 @@ public class PickInstructionService {
                     }
 
                     switch (containerStatus.toLowerCase()) {
-                        case "loaded" ->
+                        case "complete" ->
                                 enqueueItemPickedEventForTransaction(pickInstructionId, tx, pi, "bot");
                         case "unloaded" ->
-                                enqueueItemPickedEventForTransaction(pickInstructionId, tx, pi, null);
-                        case "created" ->
+                                enqueueItemPickedEventForTransaction(pickInstructionId, tx, pi, "undefined");
+                        default ->
                                 enqueueTransactionOrderUpdate(pickInstructionId, tx, sr, pi, state, subState);
-                        default -> log.debug(
-                                "No dispatch rule for containerStatus: {} | tx: {} | pickInstructionId: {}",
-                                containerStatus, txId, pickInstructionId);
                     }
                 }
             }
@@ -401,7 +447,7 @@ public class PickInstructionService {
     /**
      * Builds and enqueues an {@link ItemPickedEvent} outbox entry for a single transaction.
      *
-     * @param danglingArea "bot" for loaded/complete containers; {@code null} for unloaded containers.
+     * @param danglingArea "bot" when containerStatus is {@code complete}; "undefined" when containerStatus is {@code unloaded}.
      */
     private void enqueueItemPickedEventForTransaction(String pickInstructionId,
                                                       PickListEvent.Transaction tx,
@@ -436,13 +482,7 @@ public class PickInstructionService {
                     .pickedItemInfoList(List.of(itemInfo))
                     .build();
 
-            outboxEventRepository.save(OutboxEvent.builder()
-                    .aggregateId(pickInstructionId)
-                    .topic(itemPickedEventsTopic)
-                    .payload(objectMapper.writeValueAsString(evt))
-                    .status("PENDING")
-                    .createdAt(Instant.now())
-                    .build());
+            outboxService.save(itemPickedEventsTopic, pickInstructionId, evt, "item_picked");
             log.info("Enqueued ItemPickedEvent | pickInstructionId: {} | txId: {} | containerStatus: {} | danglingArea: {}",
                     pickInstructionId, tx.getTransactionId(),
                     tx.getContainerAttributes() != null ? tx.getContainerAttributes().getStatus() : "?",
@@ -474,13 +514,7 @@ public class PickInstructionService {
                     .subState(subState)
                     .actuals(objectMapper.convertValue(tx, new TypeReference<Map<String, Object>>() {}))
                     .build();
-            outboxEventRepository.save(OutboxEvent.builder()
-                    .aggregateId(pickInstructionId)
-                    .topic(orderUpdateEventsTopic)
-                    .payload(objectMapper.writeValueAsString(update))
-                    .status("PENDING")
-                    .createdAt(Instant.now())
-                    .build());
+            outboxService.save(orderUpdateEventsTopic, pickInstructionId, update, "order_update");
             log.info("Enqueued OrderUpdateEvent (created container) | pickInstructionId: {} | txId: {} | orderline: {}",
                     pickInstructionId, tx.getTransactionId(), sr.getExternalServiceRequestId());
         } catch (Exception e) {
@@ -501,7 +535,7 @@ public class PickInstructionService {
      */
     @Transactional
     public void enqueueOrderUpdate(String pickInstructionId, PickInstruction pi, PickListEvent event) {
-        PickListEvent.Payload payload = event.getValue() != null ? event.getValue().getPayload() : null;
+        PickListEvent.Payload payload = event.getPayload();
         if (payload == null || payload.getServiceRequests() == null) return;
 
         String state    = payload.getState();
@@ -519,13 +553,7 @@ public class PickInstructionService {
                         .subState(subState)
                         .actuals(sr.getActuals())
                         .build();
-                outboxEventRepository.save(OutboxEvent.builder()
-                        .aggregateId(pickInstructionId)
-                        .topic(orderUpdateEventsTopic)
-                        .payload(objectMapper.writeValueAsString(update))
-                        .status("PENDING")
-                        .createdAt(Instant.now())
-                        .build());
+                outboxService.save(orderUpdateEventsTopic, pickInstructionId, update, "order_update");
                 log.info("Enqueued OrderUpdateEvent | pickInstructionId: {} | orderline: {} | state: {} | sub_state: {}",
                         pickInstructionId, sr.getExternalServiceRequestId(), state, subState);
             } catch (Exception e) {
