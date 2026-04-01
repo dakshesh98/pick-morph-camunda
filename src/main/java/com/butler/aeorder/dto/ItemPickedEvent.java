@@ -29,7 +29,7 @@ import java.util.List;
 public class ItemPickedEvent {
 
     @JsonProperty("pps_id")
-    private String ppsId;
+    private int ppsId;
 
     @JsonProperty("seat_name")
     private String seatName;
@@ -96,7 +96,7 @@ public class ItemPickedEvent {
     public static class PickedItemInfo {
 
         @JsonProperty("tpid")
-        private String tpid;
+        private int tpid;
 
         @JsonProperty("item_uid")
         private String itemUid;

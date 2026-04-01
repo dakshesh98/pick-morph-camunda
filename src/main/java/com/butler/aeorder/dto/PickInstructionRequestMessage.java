@@ -22,6 +22,7 @@ public class PickInstructionRequestMessage {
     private String slotId;
     private String uom;
     private int tpid;
+    private String itemId;
     private List<String> barcodes;
     private int ppsId;
     private String binId;

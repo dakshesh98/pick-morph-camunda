@@ -6,10 +6,14 @@ import com.butler.aeorder.dto.ae.PickListResponseEvent;
 import lombok.extern.slf4j.Slf4j;
 import org.camunda.bpm.engine.MismatchingMessageCorrelationException;
 import org.camunda.bpm.engine.RuntimeService;
+import org.camunda.bpm.engine.runtime.ProcessInstance;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
+
+import java.util.Arrays;
+import java.util.Map;
 
 /**
  * Step 3 — Kafka listener for AE pick-list response messages.
@@ -64,11 +68,31 @@ public class PickListResponseListener {
                     response.getMessage());
         }
 
+        // Fetch orderId and orderlineId stored at workflow start
+        String orderId = null;
+        String orderlineId = null;
+        try {
+            ProcessInstance pi = runtimeService.createProcessInstanceQuery()
+                    .processInstanceBusinessKey("Order_workflow_" + response.getExternalServiceRequestId())
+                    .singleResult();
+            if (pi != null) {
+                Map<String, Object> processVars = runtimeService.getVariables(
+                        pi.getId(), Arrays.asList("orderId", "orderlineId"));
+                orderId     = (String) processVars.get("orderId");
+                orderlineId = (String) processVars.get("orderlineId");
+            }
+        } catch (Exception e) {
+            log.warn("Could not fetch orderId/orderlineId from process for pickInstructionId: {} — will be null in response",
+                    response.getExternalServiceRequestId());
+        }
+
         try {
             runtimeService.createMessageCorrelation("PickListResponseMessage")
                     .processInstanceVariableEquals("pickInstructionId", response.getExternalServiceRequestId())
                     .setVariable("validationSuccess", success)
-                    .setVariable("validationResult", response.getExternalServiceRequestId())
+                    .setVariable("validationStatus", success ? "SUCCESS" : "FAILURE")
+                    .setVariable("validationOrderId", orderId)
+                    .setVariable("validationOrderlineId", orderlineId)
                     .correlate();
 
             log.info("PickListResponseMessage correlated successfully for pickInstructionId: {} | success: {}",

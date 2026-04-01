@@ -27,13 +27,14 @@ public class HandleValidationFailureDelegate implements JavaDelegate {
 
     @Override
     public void execute(DelegateExecution execution) throws Exception {
-        String pickId     = (String) execution.getVariable("pickId");
-        String status     = (String) execution.getVariable("validationStatus");
-        String orderId    = (String) execution.getVariable("validationOrderId");
-        String message    = (String) execution.getVariable("validationMessage");
-        String errorCode  = (String) execution.getVariable("validationErrorCode");
-        String errorsJson = (String) execution.getVariable("validationErrors");
-        pickInstructionService.terminateWithFailureResponse(pickId, status, orderId, message, errorCode, errorsJson);
+        String pickId      = (String) execution.getVariable("pickId");
+        String status      = (String) execution.getVariable("validationStatus");
+        String orderId     = (String) execution.getVariable("validationOrderId");
+        String orderlineId = (String) execution.getVariable("validationOrderlineId");
+        String message     = (String) execution.getVariable("validationMessage");
+        String errorCode   = (String) execution.getVariable("validationErrorCode");
+        String errorsJson  = (String) execution.getVariable("validationErrors");
+        pickInstructionService.terminateWithFailureResponse(pickId, status, orderId, orderlineId, message, errorCode, errorsJson);
         log.info("Failure response queued and AE order deleted atomically | pickId: {}", pickId);
     }
 }

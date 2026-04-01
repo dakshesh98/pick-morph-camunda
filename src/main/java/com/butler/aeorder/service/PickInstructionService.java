@@ -7,7 +7,6 @@ import com.butler.aeorder.dto.OrderUpdateEvent;
 import com.butler.aeorder.dto.PickInstruction;
 import com.butler.aeorder.dto.PickInstructionRequestMessage;
 import com.butler.aeorder.dto.ae.PickListEvent;
-import com.butler.aeorder.grpc.ButlerCoreGrpcClient;
 import com.butler.aeorder.model.AeOrder;
 import com.butler.aeorder.model.AeOrdersMapping;
 import com.butler.aeorder.model.OutboxEvent;
@@ -16,7 +15,6 @@ import com.butler.aeorder.repository.AeOrderRepository;
 import com.butler.aeorder.repository.AeOrdersMappingRepository;
 import com.butler.aeorder.repository.OutboxEventRepository;
 import com.butler.aeorder.repository.TransactionStatusRepository;
-import com.greyorange.butler.core.grpc.GetPickInstructionStatusResponse;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -41,7 +39,6 @@ import java.util.Optional;
 public class PickInstructionService {
 
     private final KafkaTemplate<String, Object> kafkaTemplate;
-    private final ButlerCoreGrpcClient butlerCoreGrpcClient;
     private final TransactionStatusRepository transactionStatusRepository;
     private final AeOrderRepository aeOrderRepository;
     private final AeOrdersMappingRepository aeOrdersMappingRepository;
@@ -64,7 +61,6 @@ public class PickInstructionService {
     private String pickInstructionResponseTopic;
 
     public PickInstructionService(KafkaTemplate<String, Object> kafkaTemplate,
-                                  ButlerCoreGrpcClient butlerCoreGrpcClient,
                                   TransactionStatusRepository transactionStatusRepository,
                                   AeOrderRepository aeOrderRepository,
                                   AeOrdersMappingRepository aeOrdersMappingRepository,
@@ -74,7 +70,6 @@ public class PickInstructionService {
                                   AeOrderPersistenceService aeOrderPersistenceService,
                                   OutboxService outboxService) {
         this.kafkaTemplate = kafkaTemplate;
-        this.butlerCoreGrpcClient = butlerCoreGrpcClient;
         this.transactionStatusRepository = transactionStatusRepository;
         this.aeOrderRepository = aeOrderRepository;
         this.aeOrdersMappingRepository = aeOrdersMappingRepository;
@@ -105,13 +100,14 @@ public class PickInstructionService {
      */
     @Transactional
     public void terminateWithFailureResponse(String pickId, String status, String orderId,
-            String message, String errorCode, String errorsJson) {
+            String orderlineId, String message, String errorCode, String errorsJson) {
         aeOrderPersistenceService.markAsFailed(pickId);
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("id", pickId);
         response.put("order_id", orderId);
         response.put("status", status);
         response.put("message", message);
+        if (orderlineId != null) response.put("orderline_id", orderlineId);
         if (errorCode != null) response.put("errorCode", errorCode);
         if (errorsJson != null) {
             try {
@@ -136,7 +132,7 @@ public class PickInstructionService {
         response.put("order_id", orderId);
         response.put("status", status);
         response.put("message", message);
-        if (success && orderlineId != null) {
+        if (orderlineId != null) {
             response.put("orderline_id", orderlineId);
         }
         if (!success) {
@@ -313,6 +309,7 @@ public class PickInstructionService {
             String subState = payload.getAttributes() != null ? payload.getAttributes().getSubState() : null;
 
             boolean anyTransactions = false;
+            boolean itemPickedDispatched = false;
             for (PickListEvent.ServiceRequest sr : payload.getServiceRequests()) {
                 if (sr.getTransactions() == null || sr.getTransactions().isEmpty()) continue;
                 for (PickListEvent.Transaction tx : sr.getTransactions()) {
@@ -337,12 +334,17 @@ public class PickInstructionService {
                     }
 
                     switch (containerStatus.toLowerCase()) {
-                        case "complete" ->
-                                enqueueItemPickedEventForTransaction(pickInstructionId, tx, pi, "bot");
-                        case "unloaded" ->
-                                enqueueItemPickedEventForTransaction(pickInstructionId, tx, pi, "undefined");
-                        default ->
-                                enqueueTransactionOrderUpdate(pickInstructionId, tx, sr, pi, state, subState);
+                        case "complete" -> {
+                            enqueueItemPickedEventForTransaction(pickInstructionId, tx, pi, "bot");
+                            itemPickedDispatched = true;
+                        }
+                        case "unloaded" -> {
+                            enqueueItemPickedEventForTransaction(pickInstructionId, tx, pi, "undefined");
+                            itemPickedDispatched = true;
+                        }
+                        default -> log.debug(
+                                "Transaction {} status '{}' — SR-level order_update handled by enqueueOrderUpdate",
+                                txId, containerStatus);
                     }
                 }
             }
@@ -351,9 +353,15 @@ public class PickInstructionService {
                 log.debug("No transactions in event for pickInstructionId: {} — skipping transaction dispatch",
                         pickInstructionId);
             }
+
+            // Skip order_update when item_picked.events were sent for this event
+            if (itemPickedDispatched) {
+                log.debug("item_picked.events dispatched for pickInstructionId: {} — suppressing order_update", pickInstructionId);
+                return orderStatus;
+            }
         }
 
-        // Step 3: SR-level order update (always)
+        // Step 3: SR-level order update (only when no item_picked.events were sent)
         enqueueOrderUpdate(pickInstructionId, pi, event);
 
         return orderStatus;
@@ -382,57 +390,16 @@ public class PickInstructionService {
     // ─── Workflow completion ─────────────────────────────────────────────────
 
     /**
-     * Run workflow completion cleanup: status validation against Butler Core and Kafka audit event.
+     * Run workflow completion cleanup: publishes a Kafka audit event with the final internal status.
      */
     public void onWorkflowComplete(String pickInstructionId, String internalStatus, String failureReason) {
-        log.info("Workflow completing for pickInstructionId: {} — running cleanup and validation. internalStatus: {}",
+        log.info("Workflow completing for pickInstructionId: {} — running cleanup. internalStatus: {}",
                 pickInstructionId, internalStatus);
-
-        String externalStatus = null;
-        boolean externalIsComplete = false;
-        try {
-            GetPickInstructionStatusResponse externalResponse =
-                    butlerCoreGrpcClient.getPickInstructionStatus(pickInstructionId);
-            externalStatus = externalResponse.getStatus();
-            externalIsComplete = externalResponse.getIsComplete();
-            log.info("External status from Butler Core — pickInstructionId: {}, status: {}, isComplete: {}, " +
-                            "totalQty: {}, processedQty: {}, remainingQty: {}",
-                    pickInstructionId, externalStatus, externalIsComplete,
-                    externalResponse.getTotalQty(),
-                    externalResponse.getProcessedQty(),
-                    externalResponse.getRemainingQty());
-        } catch (Exception e) {
-            log.warn("Failed to fetch external status from Butler Core for pickInstructionId: {}. " +
-                    "Proceeding with cleanup using internal status only.", pickInstructionId, e);
-        }
-
-        if (externalStatus != null) {
-            boolean statusMismatch = false;
-            if ("COMPLETED".equals(internalStatus) && !externalIsComplete) {
-                log.warn("STATUS MISMATCH — pickInstructionId: {} is COMPLETED internally but NOT complete in Butler Core (status: {})",
-                        pickInstructionId, externalStatus);
-                statusMismatch = true;
-            } else if ("FAILED".equals(internalStatus) && externalIsComplete) {
-                log.warn("STATUS MISMATCH — pickInstructionId: {} is FAILED internally but COMPLETE in Butler Core (status: {})",
-                        pickInstructionId, externalStatus);
-                statusMismatch = true;
-            } else if ("CANCELLED".equals(internalStatus) && externalIsComplete) {
-                log.warn("STATUS MISMATCH — pickInstructionId: {} is CANCELLED internally but COMPLETE in Butler Core (status: {})",
-                        pickInstructionId, externalStatus);
-                statusMismatch = true;
-            }
-            if (!statusMismatch) {
-                log.info("Status validation PASSED — pickInstructionId: {} internal [{}] consistent with external [{}]",
-                        pickInstructionId, internalStatus, externalStatus);
-            }
-        }
 
         try {
             Map<String, Object> auditEvent = new LinkedHashMap<>();
             auditEvent.put("pickInstructionId", pickInstructionId);
             auditEvent.put("internalStatus", internalStatus);
-            auditEvent.put("externalStatus", externalStatus);
-            auditEvent.put("externalIsComplete", externalIsComplete);
             auditEvent.put("failureReason", failureReason);
             auditEvent.put("timestamp", Instant.now().toString());
             kafkaTemplate.send("workflow-complete-events-topic", pickInstructionId, auditEvent);
@@ -462,7 +429,7 @@ public class PickInstructionService {
             String itemPickedTxId = pickInstructionId + "_" + internalOrderId;
 
             ItemPickedEvent.PickedItemInfo itemInfo = ItemPickedEvent.PickedItemInfo.builder()
-                    .tpid(pi.getTpid())
+                    .tpid(Integer.parseInt(pi.getTpid()))
                     .itemUid(pi.getItemId())
                     .uom(pi.getUom())
                     .pickedQty(pickedQty)
@@ -470,9 +437,9 @@ public class PickInstructionService {
                     .build();
 
             ItemPickedEvent evt = ItemPickedEvent.builder()
-                    .ppsId(String.valueOf(pi.getPpsId()))
+                    .ppsId(pi.getPpsId())
                     .seatName(pi.getExtraFields() != null ? pi.getExtraFields().getSeatName() : null)
-                    .orderId(pickInstructionId)
+                    .orderId(pi.getOrderId())
                     .slotRef(pi.getSlotLocation())
                     .ppsBinId(pi.getBinId())
                     .transactionId(itemPickedTxId)
@@ -512,7 +479,7 @@ public class PickInstructionService {
                     .orderlineId(sr.getExternalServiceRequestId())
                     .state(state)
                     .subState(subState)
-                    .actuals(objectMapper.convertValue(tx, new TypeReference<Map<String, Object>>() {}))
+                    .transaction(objectMapper.convertValue(tx.getContainerAttributes(), new TypeReference<Map<String, Object>>() {}))
                     .build();
             outboxService.save(orderUpdateEventsTopic, pickInstructionId, update, "order_update");
             log.info("Enqueued OrderUpdateEvent (created container) | pickInstructionId: {} | txId: {} | orderline: {}",
@@ -551,7 +518,7 @@ public class PickInstructionService {
                         .orderlineId(pi.getOrderlineId())
                         .state(state)
                         .subState(subState)
-                        .actuals(sr.getActuals())
+                        .transaction(extractContainerAttributes(sr.getActuals()))
                         .build();
                 outboxService.save(orderUpdateEventsTopic, pickInstructionId, update, "order_update");
                 log.info("Enqueued OrderUpdateEvent | pickInstructionId: {} | orderline: {} | state: {} | sub_state: {}",
@@ -564,8 +531,31 @@ public class PickInstructionService {
     }
 
     /**
+     * Extracts containerAttributes from the first actuals container.
+     * Returns null (omitted via @JsonInclude) when no containers are present.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> extractContainerAttributes(Object actuals) {
+        try {
+            if (actuals instanceof Map) {
+                List<?> containers = (List<?>) ((Map<?, ?>) actuals).get("containers");
+                if (containers != null && !containers.isEmpty()) {
+                    Map<?, ?> first = (Map<?, ?>) containers.get(0);
+                    Object attrs = first.get("containerAttributes");
+                    if (attrs instanceof Map) {
+                        return (Map<String, Object>) attrs;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Could not extract containerAttributes from actuals");
+        }
+        return null;
+    }
+
+    /**
      * Builds a transaction_id as "{pickInstructionId}_{internalOrderId}" when internal_order_id
-     * is present in the first actuals container; falls back to pickInstructionId alone.
+     * is present in the first actuals container; falls back to "undefined".
      */
     @SuppressWarnings("unchecked")
     private String buildTransactionId(String pickInstructionId, Object actuals) {
@@ -585,7 +575,7 @@ public class PickInstructionService {
         } catch (Exception e) {
             log.debug("Could not extract internal_order_id from actuals for pickInstructionId: {} — using id only", pickInstructionId);
         }
-        return pickInstructionId;
+        return "undefined";
     }
 
     private void persistTransactionStatus(String txId, String pickInstructionId, String status,

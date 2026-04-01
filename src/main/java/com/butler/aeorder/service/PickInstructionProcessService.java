@@ -74,6 +74,7 @@ public class PickInstructionProcessService {
             vars.put("pickId", msg.getId());
             vars.put("pickInstructionId", msg.getId());
             vars.put("orderId", msg.getOrderId());
+            vars.put("orderlineId", msg.getOrderlineId());
             vars.put("instructionJson", instructionJson);
             vars.put("finalStatus", "UNKNOWN");
             runtimeService.startProcessInstanceByKey("pickInstructionProcess", businessKey, vars);

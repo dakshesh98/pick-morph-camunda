@@ -39,6 +39,9 @@ public class KafkaTopicConfig {
     @Value("${kafka.topics.workflow-complete-events}")
     private String workflowCompleteEventsTopic;
 
+    @Value("${kafka.topic.order-update-events}")
+    private String orderUpdateEventsTopic;
+
     @Bean
     public NewTopic pickListRequestsTopic() {
         return TopicBuilder.name(pickListRequestsTopic).partitions(1).replicas(1).build();
@@ -67,5 +70,10 @@ public class KafkaTopicConfig {
     @Bean
     public NewTopic workflowCompleteEventsTopicBean() {
         return TopicBuilder.name(workflowCompleteEventsTopic).partitions(1).replicas(1).build();
+    }
+
+    @Bean
+    public NewTopic orderUpdateEventsTopicBean() {
+        return TopicBuilder.name(orderUpdateEventsTopic).partitions(1).replicas(1).build();
     }
 }

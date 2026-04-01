@@ -37,15 +37,15 @@ public class OrderUpdateEvent {
     @JsonProperty("order_id")
     private String orderId;
 
-    @JsonProperty("orderline_id")
+    @JsonProperty("orderlineId")
     private String orderlineId;
 
     @JsonProperty("state")
     private String state;
 
-    @JsonProperty("sub_state")
+    @JsonProperty("subState")
     private String subState;
 
-    @JsonProperty("actuals")
-    private Object actuals;
+    @JsonProperty("transaction")
+    private Object transaction;
 }
